@@ -1,3 +1,20 @@
+"""Booster-pack simulation: decides what cards come out of a Play or
+Collector booster and records them into the opener's collection. This is
+the "game rules" module — no Discord code lives here, so the odds can be
+reasoned about (or unit tested) independently of the /open command in
+cogs/packs.py, which only handles cooldowns and presenting the result.
+
+Both booster types build a pack the same general way:
+1. Roll a rarity for each of the 14 main slots, independently, from a
+   weighted distribution (PLAY_RARITY_WEIGHTS / COLLECTOR_RARITY_WEIGHTS).
+2. Fetch one random base (non-special-treatment) printing per distinct
+   (set, rarity) group actually needed — one query per group, not per card.
+3. For a chosen few slots, maybe upgrade the drawn card to a
+   special-treatment printing (extended art/showcase/borderless) of the
+   same card, and/or mark it foil.
+4. Add exactly one basic land as the 15th card.
+"""
+
 import random
 from collections import Counter
 from dataclasses import dataclass
@@ -31,18 +48,22 @@ PLAY_LAND_FOIL_CHANCE = 0.20
 # --- Collector Booster: 15 cards --------------------------------------------
 # 14 independently rolled by rarity (richer distribution than Play), + 1
 # land (foil, prefers full-art). Every one of the 14 is foil whenever the
-# printing supports it. 4 of the 14 each get a chance at a special-treatment
+# printing supports it. 5 of the 14 each get a chance at a special-treatment
 # upgrade. Each of the 14 also independently has a chance to be swapped for
 # a card from the set's bonus-linked Commander deck instead.
 COLLECTOR_RARITY_WEIGHTS = {"mythic": 10, "rare": 20, "uncommon": 30, "common": 40}
 COLLECTOR_CARD_COUNT = 14
-COLLECTOR_SPECIAL_ELIGIBLE = 4
-COLLECTOR_SPECIAL_CHANCE = 0.30
-COLLECTOR_BONUS_CHANCE = 0.20
+COLLECTOR_SPECIAL_ELIGIBLE = 5
+COLLECTOR_SPECIAL_CHANCE = 0.40
+COLLECTOR_BONUS_CHANCE = 0.10
 
 
 @dataclass
 class PulledCard:
+    """One card pulled out of a booster — everything the presentation layer
+    (cogs/packs.py's PackRevealView) needs to render it, plus whatever
+    cosmetic flags apply to this particular pull."""
+
     card_id: int
     name: str
     rarity: str
@@ -53,10 +74,17 @@ class PulledCard:
 
 
 def _weighted_rarity(weights: dict[str, int]) -> str:
+    """Pick one rarity at random, weighted by the given {rarity: weight}
+    mapping (e.g. PLAY_RARITY_WEIGHTS). Weights don't need to sum to 100 —
+    random.choices normalizes them internally."""
     return random.choices(list(weights.keys()), weights=list(weights.values()))[0]
 
 
 def _can_be_foil(finishes) -> bool:
+    """Whether this printing has a foil version at all — Scryfall's
+    `finishes` list on the printing (e.g. ["nonfoil", "foil"]). Some
+    printings (certain promos, oversized cards) are foil-only or
+    nonfoil-only, so this must be checked before ever marking a pull foil."""
     return "foil" in (finishes or [])
 
 
@@ -111,6 +139,9 @@ async def _finish_card(
 
 
 async def _draw_land(set_code: str, *, foil_chance: float) -> PulledCard | None:
+    """Draw the pack's single basic-land slot. Returns None if the set has
+    no basic lands cached at all (some sets/products genuinely don't ship
+    one) — the caller simply omits the land rather than erroring."""
     rows = await database.get_random_basic_lands(set_code, 1)
     if not rows:
         return None
@@ -120,6 +151,9 @@ async def _draw_land(set_code: str, *, foil_chance: float) -> PulledCard | None:
 
 
 async def _open_play_booster(set_code: str) -> list[PulledCard]:
+    """Build a 15-card Play Booster: 14 independently-rolled cards plus one
+    basic land. 2 of the 14 slots (picked at random) are guaranteed foil; a
+    different 2 each get a chance at a special-treatment upgrade."""
     rarities = [_weighted_rarity(PLAY_RARITY_WEIGHTS) for _ in range(PLAY_CARD_COUNT)]
     rows_by_group = await _fetch_base_cards_by_group(Counter((set_code, r) for r in rarities))
     group_pointers: dict[tuple, int] = {}
@@ -152,6 +186,13 @@ async def _open_play_booster(set_code: str) -> list[PulledCard]:
 
 
 async def _open_collector_booster(set_code: str, bonus_set_code: str | None) -> list[PulledCard]:
+    """Build a 15-card Collector Booster: 14 cards from a richer rarity
+    distribution than Play (every one of which is foil whenever possible),
+    plus a guaranteed-foil land. 5 of the 14 slots each get a (higher)
+    chance at a special-treatment upgrade, and — if this set has a
+    bonus-linked Commander deck — each of the 14 slots independently has a
+    chance to be swapped for a card from that deck instead of the base set.
+    """
     plans = []  # (rarity, source_set, is_bonus) per slot
     for _ in range(COLLECTOR_CARD_COUNT):
         rarity = _weighted_rarity(COLLECTOR_RARITY_WEIGHTS)
@@ -190,6 +231,14 @@ async def _open_collector_booster(set_code: str, bonus_set_code: str | None) -> 
 
 
 async def open_pack(guild_id: int, user_id: int, set_code: str, booster_type: str = "play") -> list[PulledCard]:
+    """Open one booster of the given type for `set_code`, add every pulled
+    card to the user's per-server collection, and return the pulls (in pack
+    order — the caller doesn't need to re-sort them for display).
+
+    This is the only function in this module that touches the database for
+    anything other than reading — the actual collection write happens here,
+    once, after the whole pack has been generated.
+    """
     if booster_type == "play":
         pulled = await _open_play_booster(set_code)
     elif booster_type == "collector":

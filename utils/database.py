@@ -1,3 +1,14 @@
+"""All SQL for the bot lives here — this is the only module that talks to
+Postgres directly. Every other module (cogs and the rest of utils/) goes
+through the functions in this file rather than running queries itself, so
+the schema and query patterns stay in one place.
+
+Uses a single shared asyncpg connection pool (`_pool`), created once by
+`init_db()` at bot startup and closed by `close_db()` at shutdown. Functions
+below are grouped by the table(s) they touch: card cache, sets, collection,
+pack cooldowns, then trading.
+"""
+
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -20,6 +31,15 @@ _pool: asyncpg.Pool | None = None
 
 
 async def init_db() -> None:
+    """Create the connection pool (if it doesn't already exist) and apply
+    `db/schema.sql`. The schema file is written entirely with
+    `CREATE TABLE IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS`, so running it
+    is idempotent — safe to call every time the bot starts, including
+    against an existing database with data already in it.
+
+    Called once from `bot.py`'s `setup_hook`, and also directly by every
+    script in `scripts/` (which run standalone, outside the bot process).
+    """
     global _pool
     if _pool is None:
         # statement_cache_size=0: required for pgbouncer transaction-mode
@@ -36,6 +56,8 @@ async def init_db() -> None:
 
 
 async def close_db() -> None:
+    """Close the connection pool cleanly. Called on bot shutdown and at the
+    end of every standalone script in `scripts/`."""
     global _pool
     if _pool is not None:
         await _pool.close()
@@ -43,6 +65,9 @@ async def close_db() -> None:
 
 
 def _get_pool() -> asyncpg.Pool:
+    """Return the shared pool, or raise if `init_db()` hasn't run yet —
+    every query function below goes through this rather than touching the
+    `_pool` global directly."""
     if _pool is None:
         raise RuntimeError("Database pool not initialized; call init_db() first.")
     return _pool
@@ -92,6 +117,9 @@ async def upsert_cards(rows: list[tuple]) -> int:
 
 
 async def set_is_cached(set_code: str) -> bool:
+    """Whether any card printing from `set_code` has been synced into the
+    `cards` table — used to give a helpful "not cached yet" message instead
+    of silently returning empty results."""
     pool = _get_pool()
     return await pool.fetchval("SELECT EXISTS (SELECT 1 FROM cards WHERE set_code = $1)", set_code)
 
@@ -244,6 +272,9 @@ async def prune_non_major_sets(major_set_types: list[str]) -> dict[str, int]:
 
 
 async def get_all_sets() -> list[asyncpg.Record]:
+    """Every cached set's metadata, newest release first. Backs
+    utils.sets's in-memory cache — see utils/sets.py for why that cache
+    exists (this table is read on nearly every command)."""
     pool = _get_pool()
     return await pool.fetch(
         "SELECT code, name, set_type, released_at, parent_set_code FROM sets ORDER BY released_at DESC NULLS LAST"
@@ -251,6 +282,8 @@ async def get_all_sets() -> list[asyncpg.Record]:
 
 
 async def get_set_by_code(code: str) -> asyncpg.Record | None:
+    """Look up one set by its exact code (case-insensitive), or None if
+    that code isn't cached."""
     pool = _get_pool()
     return await pool.fetchrow(
         "SELECT code, name, set_type, released_at, parent_set_code FROM sets WHERE code = $1", code.lower()
@@ -258,6 +291,8 @@ async def get_set_by_code(code: str) -> asyncpg.Record | None:
 
 
 async def get_set_by_name(name: str) -> asyncpg.Record | None:
+    """Look up one set by its exact name (case-insensitive), or None if no
+    set has that exact name cached."""
     pool = _get_pool()
     return await pool.fetchrow(
         "SELECT code, name, set_type, released_at, parent_set_code FROM sets WHERE LOWER(name) = LOWER($1)", name
@@ -270,6 +305,11 @@ async def get_set_by_name(name: str) -> asyncpg.Record | None:
 
 
 async def add_to_collection(guild_id: int, user_id: int, card_ids: list[int]) -> None:
+    """Add one or more printings to a user's per-server collection,
+    incrementing quantity for any already owned. `card_ids` may contain
+    duplicates (e.g. a booster pulling the same printing twice) — those are
+    collapsed into a single counted upsert per distinct card_id rather than
+    one row-locking round trip per individual card."""
     counts: dict[int, int] = {}
     for card_id in card_ids:
         counts[card_id] = counts.get(card_id, 0) + 1
@@ -426,6 +466,11 @@ async def get_set_progress(guild_id: int, user_id: int, set_code: str) -> dict[s
 async def get_missing_cards(
     guild_id: int, user_id: int, set_code: str, rarity: str | None = None
 ) -> list[asyncpg.Record]:
+    """Every non-basic-land printing in `set_code` this user doesn't own
+    yet in this server, optionally narrowed to one `rarity`. Ordered by
+    collector number numerically (the regex strips any letter suffix like
+    "150a" down to "150" for sorting) so results read in booster/set order
+    instead of lexicographic order (which would put "10" before "2")."""
     pool = _get_pool()
     return await pool.fetch(
         r"""
@@ -526,10 +571,20 @@ async def claim_free_pack(guild_id: int, user_id: int, booster_type: str) -> tim
 
 # ---------------------------------------------------------------------------
 # Trading
+#
+# NOTE: player-to-player trade offers (as opposed to /tradeup's solo
+# duplicate-spending, which is handled separately in utils/tradeup.py). The
+# `trades` table and this whole section exist and are fully functional, but
+# no cog currently exposes a slash command that calls them — there is no
+# /trade command yet. Wiring one up would mean: create_trade to open an
+# offer, get_pending_trades to list a user's open offers, and
+# execute_trade/decline_trade to resolve one.
 # ---------------------------------------------------------------------------
 
 
 async def create_trade(guild_id: int, from_user: int, to_user: int, offer_card_id: int, request_card_id: int) -> int:
+    """Open a pending trade offer: `from_user` offers `offer_card_id` in
+    exchange for `to_user`'s `request_card_id`. Returns the new trade's id."""
     pool = _get_pool()
     return await pool.fetchval(
         """
@@ -545,6 +600,8 @@ async def create_trade(guild_id: int, from_user: int, to_user: int, offer_card_i
 
 
 async def get_pending_trades(guild_id: int, user_id: int) -> list[asyncpg.Record]:
+    """Every still-open trade involving this user in this server, as
+    either the offering or receiving side, newest first."""
     pool = _get_pool()
     return await pool.fetch(
         "SELECT * FROM trades WHERE guild_id = $1 AND (from_user = $2 OR to_user = $2) AND status = 'pending' ORDER BY created_at DESC",
@@ -554,6 +611,8 @@ async def get_pending_trades(guild_id: int, user_id: int) -> list[asyncpg.Record
 
 
 async def decline_trade(trade_id: int) -> None:
+    """Mark a pending trade declined. A no-op if the trade is no longer
+    pending (already resolved by someone else)."""
     pool = _get_pool()
     await pool.execute(
         "UPDATE trades SET status = 'declined', resolved_at = now() WHERE id = $1 AND status = 'pending'",
@@ -562,6 +621,9 @@ async def decline_trade(trade_id: int) -> None:
 
 
 async def _move_card(conn: asyncpg.Connection, guild_id: int, from_user: int, to_user: int, card_id: int) -> None:
+    """Transfer one copy of `card_id` from `from_user` to `to_user` within
+    an existing transaction — used twice by execute_trade (once per
+    direction of the swap) so both transfers commit or roll back together."""
     await conn.execute(
         "UPDATE collection SET quantity = quantity - 1 WHERE guild_id = $1 AND user_id = $2 AND card_id = $3",
         guild_id,

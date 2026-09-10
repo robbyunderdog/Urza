@@ -1,3 +1,6 @@
+"""The /tradeup slash command — thin Discord-facing wrapper around the
+trade-up rules in utils/tradeup.py."""
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -16,6 +19,9 @@ class TradeUp(commands.Cog):
     @app_commands.describe(set_query="Set to trade up within", rarity="Rarity to spend duplicates of")
     @app_commands.rename(set_query="set")
     @app_commands.choices(
+        # Only the three rarities that *can* be traded up from are offered
+        # as choices — mythic has no rarity above it, so it's excluded here
+        # rather than accepted and rejected later in utils.tradeup.trade_up.
         rarity=[
             app_commands.Choice(name="Common → Uncommon", value="common"),
             app_commands.Choice(name="Uncommon → Rare", value="uncommon"),
@@ -26,6 +32,11 @@ class TradeUp(commands.Cog):
     async def tradeup_cmd(
         self, interaction: discord.Interaction, set_query: str, rarity: app_commands.Choice[str]
     ) -> None:
+        """Resolve the requested set, verify it has cards cached, then hand
+        off to utils.tradeup.trade_up to do the actual spend-and-draw. Any
+        failure (ambiguous/unknown set, not enough duplicates, etc.) is
+        reported back to the user as plain text rather than raised further.
+        """
         await interaction.response.defer()
 
         try:

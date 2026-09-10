@@ -19,6 +19,9 @@ from utils.sets import MAJOR_SET_TYPES  # noqa: E402
 
 
 async def prune() -> dict:
+    """Delegate to database.prune_non_major_sets with the current major-set
+    type list, returning its {cards, sets, collection_rows, trade_rows}
+    deletion counts."""
     await database.init_db()
     try:
         return await database.prune_non_major_sets(list(MAJOR_SET_TYPES))

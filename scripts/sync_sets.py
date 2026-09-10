@@ -30,12 +30,17 @@ SETS_URL = "https://api.scryfall.com/sets"
 
 
 def _parse_date(value: str | None) -> date | None:
+    """Parse Scryfall's ISO date string into a `date`, or None if the set
+    has no release date on file (e.g. some unreleased/undated products)."""
     if not value:
         return None
     return date.fromisoformat(value)
 
 
 async def fetch_sets(session: aiohttp.ClientSession) -> list[dict]:
+    """Fetch every set from Scryfall's paginated /sets endpoint, following
+    `next_page` links until exhausted. A small sleep between pages keeps
+    well under Scryfall's rate-limit guidance."""
     sets: list[dict] = []
     url = SETS_URL
     while url:
@@ -50,6 +55,11 @@ async def fetch_sets(session: aiohttp.ClientSession) -> list[dict]:
 
 
 async def sync_sets() -> tuple[int, int]:
+    """Fetch all sets from Scryfall, filter down to the curated "major set"
+    list (see utils.sets.MAJOR_SET_TYPES) plus any Commander deck
+    bonus-linked to one of those, and upsert them into the `sets` table.
+    Returns (sets upserted, of those how many were bonus-linked Commander decks).
+    """
     async with aiohttp.ClientSession(headers={"User-Agent": "UrzaDiscordBot/1.0"}) as session:
         raw_sets = await fetch_sets(session)
 

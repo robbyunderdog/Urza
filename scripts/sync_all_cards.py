@@ -36,6 +36,9 @@ SKIP_LAYOUTS = {"token", "art_series", "double_faced_token", "emblem", "planar",
 
 
 def _image_url(card: dict) -> str | None:
+    """A representative image URL for the card: its own image_uris if it
+    has one, otherwise the first face's (for double-faced cards). None if
+    neither is present."""
     if "image_uris" in card:
         return card["image_uris"].get("normal")
     faces = card.get("card_faces") or []
@@ -45,6 +48,9 @@ def _image_url(card: dict) -> str | None:
 
 
 def _to_row(card: dict) -> tuple:
+    """Convert one Scryfall card object into the tuple shape
+    `database.upsert_cards` expects (matches the `cards` table's columns
+    in order)."""
     return (
         card["id"],
         card["oracle_id"],
@@ -64,6 +70,10 @@ def _to_row(card: dict) -> tuple:
 
 
 def _wanted(card: dict, allowed_set_codes: set[str]) -> bool:
+    """Whether this card belongs in the cache: English, a physical
+    (non-digital-only) printing, a playable-pack layout (not a token/art
+    card/etc.), and from a set already present in the `sets` table (i.e.
+    one sync_sets.py decided was worth keeping)."""
     return (
         card.get("lang") == "en"
         and not card.get("digital")
@@ -83,18 +93,29 @@ def _safe_to_row(card: dict) -> tuple | None:
 
 
 async def fetch_bulk_meta(session: aiohttp.ClientSession) -> dict:
+    """Fetch metadata about Scryfall's "default_cards" bulk export (its
+    current download URL, size, etc.) — the actual data is a separate,
+    much larger download fetched via that URL."""
     async with session.get(BULK_DATA_INFO_URL) as resp:
         resp.raise_for_status()
         return await resp.json()
 
 
 async def download_bytes(session: aiohttp.ClientSession, url: str) -> bytes:
+    """Download a URL's full body into memory. Used for the (large,
+    gzip-compressed) bulk data file itself."""
     async with session.get(url) as resp:
         resp.raise_for_status()
         return await resp.read()
 
 
 async def sync_all_cards() -> int:
+    """Download Scryfall's full bulk card export, decompress it, and
+    upsert every wanted card (see `_wanted`) in batches of CHUNK_SIZE.
+    Requires the `sets` table to already be populated (run sync_sets.py
+    first) — that's what defines which sets are "allowed". Returns the
+    total number of cards upserted.
+    """
     async with aiohttp.ClientSession(headers={"User-Agent": "UrzaDiscordBot/1.0"}) as session:
         meta = await fetch_bulk_meta(session)
         download_uri = meta.get("jsonl_download_uri") or meta.get("download_uri")
@@ -119,6 +140,10 @@ async def sync_all_cards() -> int:
         batch: list[tuple] = []
 
         async def flush() -> None:
+            """Upsert the accumulated batch and reset it. Called every
+            CHUNK_SIZE cards during the scan, plus once more at the end for
+            whatever's left over — keeps memory bounded on a tens-of-thousands
+            of rows export instead of building one giant insert."""
             nonlocal total, batch
             if batch:
                 total += await database.upsert_cards(batch)

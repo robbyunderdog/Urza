@@ -21,6 +21,12 @@ from utils import database  # noqa: E402
 
 
 async def migrate() -> None:
+    """Run the one-time id migration described in the module docstring
+    above. Checks whether `scryfall_id` already exists (meaning a previous
+    run already migrated this database) and exits early if so, so it's
+    always safe to re-run. Everything else happens inside one transaction,
+    verified by comparing row counts before and after.
+    """
     await database.init_db()
     pool = database._get_pool()
     try:

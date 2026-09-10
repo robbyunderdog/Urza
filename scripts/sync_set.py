@@ -22,6 +22,10 @@ SKIP_LAYOUTS = {"token", "art_series", "double_faced_token", "emblem", "planar",
 
 
 def _image_url(card: dict) -> str | None:
+    """A representative image URL for the card: its own image_uris if it
+    has one, otherwise the first face's (for double-faced cards, which
+    carry images per-face instead of at the top level). None if neither
+    is present (rare, but not unheard of for some layouts)."""
     if "image_uris" in card:
         return card["image_uris"].get("normal")
     faces = card.get("card_faces") or []
@@ -31,6 +35,10 @@ def _image_url(card: dict) -> str | None:
 
 
 async def fetch_set(session: aiohttp.ClientSession, set_code: str) -> list[dict]:
+    """Fetch every printing in `set_code` via Scryfall's card search API
+    (unique=prints returns every printing, not just one per card name),
+    following pagination until exhausted. Returns [] if the set code
+    doesn't exist on Scryfall (a 404) rather than raising."""
     cards: list[dict] = []
     url = SCRYFALL_SEARCH_URL
     params: dict | None = {"q": f"set:{set_code}", "unique": "prints"}
@@ -52,6 +60,9 @@ async def fetch_set(session: aiohttp.ClientSession, set_code: str) -> list[dict]
 
 
 def _to_row(card: dict) -> tuple:
+    """Convert one Scryfall card object into the tuple shape
+    `database.upsert_cards` expects (matches the `cards` table's columns
+    in order)."""
     return (
         card["id"],
         card["oracle_id"],
@@ -71,6 +82,10 @@ def _to_row(card: dict) -> tuple:
 
 
 async def sync_set(set_code: str) -> int:
+    """Fetch and cache every playable-pack printing in `set_code`: pulls
+    every printing from Scryfall, drops digital-only cards and non-pack
+    layouts (tokens, art cards, etc.), and upserts the rest. Returns the
+    number of rows upserted."""
     set_code = set_code.lower()
     async with aiohttp.ClientSession(headers={"User-Agent": "UrzaDiscordBot/1.0"}) as session:
         cards = await fetch_set(session, set_code)
