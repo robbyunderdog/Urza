@@ -26,7 +26,10 @@ async def init_db() -> None:
         # poolers (Neon's pooled endpoint, Supabase's port-6543 pooler).
         # Harmless on a direct connection too, so it's left on unconditionally.
         _pool = await asyncpg.create_pool(
-            config.DATABASE_URL, min_size=1, max_size=5, statement_cache_size=0
+            config.DATABASE_URL,
+            min_size=config.DB_POOL_MIN_SIZE,
+            max_size=config.DB_POOL_MAX_SIZE,
+            statement_cache_size=0,
         )
     async with _pool.acquire() as conn:
         await conn.execute(SCHEMA_PATH.read_text())
@@ -51,21 +54,24 @@ def _get_pool() -> asyncpg.Pool:
 
 
 async def upsert_cards(rows: list[tuple]) -> int:
-    """Bulk insert/update printing rows. Each row is a tuple matching the
-    cards table column order: (id, oracle_id, name, set_code,
-    collector_number, rarity, is_basic_land, frame_effects, finishes,
-    full_art, border_color, mana_cost, type_line, image_url).
+    """Bulk insert/update printing rows. Each row is a tuple matching:
+    (scryfall_id, oracle_id, name, set_code, collector_number, rarity,
+    is_basic_land, frame_effects, finishes, full_art, border_color,
+    mana_cost, type_line, image_url). The internal integer `id` (what
+    collection/trades actually reference) is assigned automatically on
+    first insert and never touched on update, so it stays stable across
+    re-syncs.
     """
     pool = _get_pool()
     async with pool.acquire() as conn:
         await conn.executemany(
             """
             INSERT INTO cards (
-                id, oracle_id, name, set_code, collector_number, rarity, is_basic_land,
+                scryfall_id, oracle_id, name, set_code, collector_number, rarity, is_basic_land,
                 frame_effects, finishes, full_art, border_color, mana_cost, type_line, image_url
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-            ON CONFLICT (id) DO UPDATE SET
+            ON CONFLICT (scryfall_id) DO UPDATE SET
                 oracle_id = EXCLUDED.oracle_id,
                 name = EXCLUDED.name,
                 set_code = EXCLUDED.set_code,
@@ -213,10 +219,10 @@ async def prune_non_major_sets(major_set_types: list[str]) -> dict[str, int]:
 
             collection_deleted = trades_deleted = 0
             if minor_ids:
-                result = await conn.execute("DELETE FROM collection WHERE card_id = ANY($1::uuid[])", minor_ids)
+                result = await conn.execute("DELETE FROM collection WHERE card_id = ANY($1::int[])", minor_ids)
                 collection_deleted = int(result.split()[-1])
                 result = await conn.execute(
-                    "DELETE FROM trades WHERE offer_card_id = ANY($1::uuid[]) OR request_card_id = ANY($1::uuid[])",
+                    "DELETE FROM trades WHERE offer_card_id = ANY($1::int[]) OR request_card_id = ANY($1::int[])",
                     minor_ids,
                 )
                 trades_deleted = int(result.split()[-1])
@@ -263,8 +269,8 @@ async def get_set_by_name(name: str) -> asyncpg.Record | None:
 # ---------------------------------------------------------------------------
 
 
-async def add_to_collection(guild_id: int, user_id: int, card_ids: list[str]) -> None:
-    counts: dict[str, int] = {}
+async def add_to_collection(guild_id: int, user_id: int, card_ids: list[int]) -> None:
+    counts: dict[int, int] = {}
     for card_id in card_ids:
         counts[card_id] = counts.get(card_id, 0) + 1
     if not counts:
@@ -348,9 +354,12 @@ async def count_spendable_duplicates(guild_id: int, user_id: int, set_code: str,
 
 
 async def spend_duplicates(guild_id: int, user_id: int, set_code: str, rarity: str, amount: int) -> int:
-    """Consume up to `amount` duplicate copies of a given set+rarity from a
-    user's collection in this server, never reducing any printing below
-    quantity 1. Returns how many were actually spent."""
+    """Atomically spend exactly `amount` duplicate copies of a given
+    set+rarity from a user's collection, or none at all if there aren't
+    enough — never a partial spend (the sufficiency check and the spend
+    happen under the same row lock, closing the race where a concurrent
+    call could take duplicates out from under a check that already passed).
+    Returns `amount` on success or 0 if there weren't enough."""
     pool = _get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -369,6 +378,10 @@ async def spend_duplicates(guild_id: int, user_id: int, set_code: str, rarity: s
                 set_code,
                 rarity,
             )
+            available = sum(row["quantity"] - 1 for row in rows)
+            if available < amount:
+                return 0
+
             remaining = amount
             for row in rows:
                 if remaining <= 0:
@@ -384,7 +397,7 @@ async def spend_duplicates(guild_id: int, user_id: int, set_code: str, rarity: s
                     row["card_id"],
                 )
                 remaining -= take
-            return amount - remaining
+            return amount
 
 
 async def get_set_progress(guild_id: int, user_id: int, set_code: str) -> dict[str, tuple[int, int]]:
@@ -466,6 +479,19 @@ PACK_COOLDOWNS = {
 }
 
 
+async def release_pack_claim(guild_id: int, user_id: int, booster_type: str) -> None:
+    """Undo a claim_free_pack claim — used when pack generation fails after
+    the cooldown was already claimed, so a transient error doesn't cost the
+    user their free pack for nothing."""
+    pool = _get_pool()
+    await pool.execute(
+        "DELETE FROM pack_cooldowns WHERE guild_id = $1 AND user_id = $2 AND booster_type = $3",
+        guild_id,
+        user_id,
+        booster_type,
+    )
+
+
 async def claim_free_pack(guild_id: int, user_id: int, booster_type: str) -> timedelta | None:
     """Try to claim a free pack in this server. Returns None on success (and
     records the claim), or the remaining wait time if still on cooldown."""
@@ -503,7 +529,7 @@ async def claim_free_pack(guild_id: int, user_id: int, booster_type: str) -> tim
 # ---------------------------------------------------------------------------
 
 
-async def create_trade(guild_id: int, from_user: int, to_user: int, offer_card_id: str, request_card_id: str) -> int:
+async def create_trade(guild_id: int, from_user: int, to_user: int, offer_card_id: int, request_card_id: int) -> int:
     pool = _get_pool()
     return await pool.fetchval(
         """
@@ -535,7 +561,7 @@ async def decline_trade(trade_id: int) -> None:
     )
 
 
-async def _move_card(conn: asyncpg.Connection, guild_id: int, from_user: int, to_user: int, card_id: str) -> None:
+async def _move_card(conn: asyncpg.Connection, guild_id: int, from_user: int, to_user: int, card_id: int) -> None:
     await conn.execute(
         "UPDATE collection SET quantity = quantity - 1 WHERE guild_id = $1 AND user_id = $2 AND card_id = $3",
         guild_id,

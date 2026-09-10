@@ -1,4 +1,5 @@
 import difflib
+import time
 
 import asyncpg
 
@@ -23,6 +24,29 @@ MAX_CANDIDATES_SHOWN = 8
 # entirely, same as before.
 MAJOR_SET_TYPES = {"core", "expansion", "masters", "draft_innovation", "funny"}
 
+# The sets table is small (a couple hundred rows) and changes only when an
+# admin runs a sync script, but it's read on nearly every command (anything
+# that takes a `set` argument). Caching it in memory turns that into zero
+# extra DB round trips for the common case, instead of 1-3 per command.
+_CACHE_TTL_SECONDS = 600
+_cache: list[asyncpg.Record] | None = None
+_cache_loaded_at: float = 0.0
+
+
+def invalidate_cache() -> None:
+    """Force the next resolve_set call to refetch from the database."""
+    global _cache
+    _cache = None
+
+
+async def _get_cached_sets() -> list[asyncpg.Record]:
+    global _cache, _cache_loaded_at
+    now = time.monotonic()
+    if _cache is None or (now - _cache_loaded_at) > _CACHE_TTL_SECONDS:
+        _cache = await database.get_all_sets()
+        _cache_loaded_at = now
+    return _cache
+
 
 class SetNotFoundError(Exception):
     pass
@@ -41,26 +65,28 @@ async def resolve_set(query: str) -> asyncpg.Record:
 
     Tries, in order: exact code, exact name, unique substring match, then a
     fuzzy match. Raises SetNotFoundError or AmbiguousSetError otherwise.
+    Reads from an in-memory cache of the (small, rarely-changing) sets
+    table rather than hitting the database on every call.
     """
     query = query.strip()
     if not query:
         raise SetNotFoundError("No set specified.")
 
-    exact_code = await database.get_set_by_code(query)
-    if exact_code:
-        return exact_code
-
-    exact_name = await database.get_set_by_name(query)
-    if exact_name:
-        return exact_name
-
-    all_sets = await database.get_all_sets()
+    all_sets = await _get_cached_sets()
     if not all_sets:
         raise SetNotFoundError(
             "No set data cached yet — an admin needs to run `python scripts/sync_sets.py`."
         )
 
     lowered = query.lower()
+
+    for s in all_sets:
+        if s["code"].lower() == lowered:
+            return s
+    for s in all_sets:
+        if s["name"].lower() == lowered:
+            return s
+
     substring_matches = [s for s in all_sets if lowered in s["name"].lower()]
     if len(substring_matches) == 1:
         return substring_matches[0]

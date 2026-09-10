@@ -1,10 +1,14 @@
 -- Printing-level card cache, populated from the Scryfall API (every English
--- printing). Keyed by Scryfall's print id since the same card (oracle_id)
--- can have many printings with different art/set/collector number, and both
--- pack opening and collection tracking need to know exactly which printing
--- is involved.
+-- printing). oracle_id identifies the card (same across reprints); scryfall_id
+-- is Scryfall's own UUID for this exact printing, kept only to match against
+-- their API on sync. The PK is a plain integer surrogate (id) rather than
+-- scryfall_id's UUID directly, since this id is what collection/trades store
+-- per row — 4 bytes instead of 16 adds up across millions of rows. See
+-- scripts/migrate_card_ids.py for the one-time migration on a database
+-- created before this was the case.
 CREATE TABLE IF NOT EXISTS cards (
-    id UUID PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
+    scryfall_id UUID NOT NULL UNIQUE,
     oracle_id UUID NOT NULL,
     name TEXT NOT NULL,
     set_code TEXT NOT NULL,
@@ -57,7 +61,7 @@ ALTER TABLE sets ADD COLUMN IF NOT EXISTS parent_set_code TEXT;
 CREATE TABLE IF NOT EXISTS collection (
     guild_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
-    card_id UUID NOT NULL,
+    card_id INTEGER NOT NULL,
     quantity INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (guild_id, user_id, card_id)
 );
@@ -80,8 +84,8 @@ CREATE TABLE IF NOT EXISTS trades (
     guild_id BIGINT NOT NULL,
     from_user BIGINT NOT NULL,
     to_user BIGINT NOT NULL,
-    offer_card_id UUID NOT NULL,
-    request_card_id UUID NOT NULL,
+    offer_card_id INTEGER NOT NULL,
+    request_card_id INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     resolved_at TIMESTAMPTZ

@@ -1,4 +1,5 @@
 import random
+from collections import Counter
 from dataclasses import dataclass
 
 from utils import database
@@ -42,7 +43,7 @@ COLLECTOR_BONUS_CHANCE = 0.20
 
 @dataclass
 class PulledCard:
-    card_id: str
+    card_id: int
     name: str
     rarity: str
     image_url: str | None
@@ -59,24 +60,30 @@ def _can_be_foil(finishes) -> bool:
     return "foil" in (finishes or [])
 
 
-async def _draw_card(
+async def _fetch_base_cards_by_group(groups: Counter) -> dict[tuple, list]:
+    """Fetch every (set_code, rarity) group's cards in one query per group,
+    instead of one query per card — a 14-card pack only needs a handful of
+    distinct (set, rarity) combinations, not 14 round trips. Each group's
+    rows come back distinct (no duplicate printing within that group)."""
+    rows_by_group: dict[tuple, list] = {}
+    for (set_code, rarity), count in groups.items():
+        rows_by_group[(set_code, rarity)] = await database.get_random_cards(
+            set_code, rarity, count, exclude_basic_land=True, exclude_special_treatment=True
+        )
+    return rows_by_group
+
+
+async def _finish_card(
+    row,
     set_code: str,
-    rarity: str,
     *,
     foil_chance: float = 0.0,
     special_chance: float = 0.0,
     bonus: bool = False,
-) -> PulledCard | None:
-    """Draw one base-version card, maybe upgrade it to a special-treatment
-    printing of the same card, then decide foil based on whatever printing
-    it ends up as. Basic lands are excluded — they only ever come from the
-    pack's dedicated guaranteed land slot, never one of the regular cards."""
-    rows = await database.get_random_cards(
-        set_code, rarity, 1, exclude_basic_land=True, exclude_special_treatment=True
-    )
-    if not rows:
-        return None
-    row = rows[0]
+) -> PulledCard:
+    """Given an already-drawn base printing, maybe upgrade it to a
+    special-treatment printing of the same card, then decide foil based on
+    whatever printing it ends up as."""
     card_id, oracle_id, name, drawn_rarity, image_url, finishes = (
         row["id"],
         row["oracle_id"],
@@ -100,7 +107,7 @@ async def _draw_card(
             special = True
 
     foil = _can_be_foil(finishes) and random.random() < foil_chance
-    return PulledCard(str(card_id), name, drawn_rarity, image_url, foil, special, bonus)
+    return PulledCard(card_id, name, drawn_rarity, image_url, foil, special, bonus)
 
 
 async def _draw_land(set_code: str, *, foil_chance: float) -> PulledCard | None:
@@ -109,24 +116,33 @@ async def _draw_land(set_code: str, *, foil_chance: float) -> PulledCard | None:
         return None
     row = rows[0]
     foil = _can_be_foil(row["finishes"]) and random.random() < foil_chance
-    return PulledCard(str(row["id"]), row["name"], row["rarity"], row["image_url"], foil)
+    return PulledCard(row["id"], row["name"], row["rarity"], row["image_url"], foil)
 
 
 async def _open_play_booster(set_code: str) -> list[PulledCard]:
+    rarities = [_weighted_rarity(PLAY_RARITY_WEIGHTS) for _ in range(PLAY_CARD_COUNT)]
+    rows_by_group = await _fetch_base_cards_by_group(Counter((set_code, r) for r in rarities))
+    group_pointers: dict[tuple, int] = {}
+
     foil_indices = set(random.sample(range(PLAY_CARD_COUNT), PLAY_GUARANTEED_FOILS))
     special_indices = set(random.sample(range(PLAY_CARD_COUNT), PLAY_SPECIAL_ELIGIBLE))
 
     pulled: list[PulledCard] = []
-    for i in range(PLAY_CARD_COUNT):
-        rarity = _weighted_rarity(PLAY_RARITY_WEIGHTS)
-        card = await _draw_card(
+    for i, rarity in enumerate(rarities):
+        group = (set_code, rarity)
+        pointer = group_pointers.get(group, 0)
+        rows = rows_by_group[group]
+        if pointer >= len(rows):
+            continue  # not enough cards of that rarity cached — skip this slot
+        group_pointers[group] = pointer + 1
+
+        card = await _finish_card(
+            rows[pointer],
             set_code,
-            rarity,
             foil_chance=1.0 if i in foil_indices else 0.0,
             special_chance=PLAY_SPECIAL_CHANCE if i in special_indices else 0.0,
         )
-        if card:
-            pulled.append(card)
+        pulled.append(card)
 
     land = await _draw_land(set_code, foil_chance=PLAY_LAND_FOIL_CHANCE)
     if land:
@@ -136,22 +152,35 @@ async def _open_play_booster(set_code: str) -> list[PulledCard]:
 
 
 async def _open_collector_booster(set_code: str, bonus_set_code: str | None) -> list[PulledCard]:
-    special_indices = set(random.sample(range(COLLECTOR_CARD_COUNT), COLLECTOR_SPECIAL_ELIGIBLE))
-
-    pulled: list[PulledCard] = []
-    for i in range(COLLECTOR_CARD_COUNT):
+    plans = []  # (rarity, source_set, is_bonus) per slot
+    for _ in range(COLLECTOR_CARD_COUNT):
         rarity = _weighted_rarity(COLLECTOR_RARITY_WEIGHTS)
         use_bonus = bool(bonus_set_code) and random.random() < COLLECTOR_BONUS_CHANCE
         source_set = bonus_set_code if use_bonus else set_code
-        card = await _draw_card(
+        plans.append((rarity, source_set, use_bonus))
+
+    rows_by_group = await _fetch_base_cards_by_group(Counter((source_set, rarity) for rarity, source_set, _ in plans))
+    group_pointers: dict[tuple, int] = {}
+
+    special_indices = set(random.sample(range(COLLECTOR_CARD_COUNT), COLLECTOR_SPECIAL_ELIGIBLE))
+
+    pulled: list[PulledCard] = []
+    for i, (rarity, source_set, is_bonus) in enumerate(plans):
+        group = (source_set, rarity)
+        pointer = group_pointers.get(group, 0)
+        rows = rows_by_group[group]
+        if pointer >= len(rows):
+            continue
+        group_pointers[group] = pointer + 1
+
+        card = await _finish_card(
+            rows[pointer],
             source_set,
-            rarity,
             foil_chance=1.0,
             special_chance=COLLECTOR_SPECIAL_CHANCE if i in special_indices else 0.0,
-            bonus=use_bonus,
+            bonus=is_bonus,
         )
-        if card:
-            pulled.append(card)
+        pulled.append(card)
 
     land = await _draw_land(set_code, foil_chance=1.0)
     if land:

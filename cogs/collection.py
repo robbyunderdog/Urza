@@ -4,6 +4,7 @@ from discord.ext import commands
 
 from utils import database, sets
 from utils.packs import RARITY_EMOJI
+from utils.views import SafeView
 
 SETS_PER_PAGE = 15
 MAX_MISSING_SHOWN = 40
@@ -56,7 +57,7 @@ async def resolve_set_or_report(interaction: discord.Interaction, query: str):
         return None
 
 
-class SetListPaginator(discord.ui.View):
+class SetListPaginator(SafeView):
     """Pages through every cached set's overall progress, newest first."""
 
     def __init__(self, user_id: int, display_name: str, rows: list):

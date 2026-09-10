@@ -5,6 +5,7 @@ from discord.ext import commands
 import config
 from utils import database, packs, sets
 from utils.packs import BOOSTER_LABELS, RARITY_EMOJI
+from utils.views import SafeView
 
 BOOSTER_CHOICES = [
     app_commands.Choice(name="Play Booster", value="play"),
@@ -25,7 +26,7 @@ def _card_title(card: packs.PulledCard) -> str:
     return title
 
 
-class PackRevealView(discord.ui.View):
+class PackRevealView(SafeView):
     """Flip through a freshly opened pack one card at a time."""
 
     def __init__(self, user_id: int, header: str, pulled: list[packs.PulledCard]):
@@ -138,7 +139,15 @@ class Packs(commands.Cog):
             )
             return
 
-        pulled = await packs.open_pack(interaction.guild_id, interaction.user.id, set_code, booster_value)
+        try:
+            pulled = await packs.open_pack(interaction.guild_id, interaction.user.id, set_code, booster_value)
+        except Exception:
+            # The cooldown was already claimed above — if generating the pack
+            # blew up partway through, give it back rather than silently
+            # costing the user their free pack for a transient failure.
+            await database.release_pack_claim(interaction.guild_id, interaction.user.id, booster_value)
+            raise
+
         header = f"{interaction.user.display_name}'s {set_name} {BOOSTER_LABELS[booster_value]}"
         view = PackRevealView(interaction.user.id, header, pulled)
         await interaction.followup.send(embed=view.current_embed(), view=view)

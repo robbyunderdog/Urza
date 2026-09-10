@@ -12,6 +12,11 @@ DEFAULT_SET_CODE = (os.getenv("DEFAULT_SET_CODE") or "").lower() or None
 PACK_COOLDOWN_PLAY_SECONDS = int(os.getenv("PACK_COOLDOWN_PLAY_SECONDS", 4 * 3600))
 PACK_COOLDOWN_COLLECTOR_SECONDS = int(os.getenv("PACK_COOLDOWN_COLLECTOR_SECONDS", 8 * 3600))
 
+# Neon/Supabase pooled endpoints comfortably support more than this; raise it
+# if you deploy to many concurrent guilds and see pool-exhaustion warnings.
+DB_POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN_SIZE", 2))
+DB_POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", 20))
+
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is not set. Copy .env.example to .env and fill it in.")
 
