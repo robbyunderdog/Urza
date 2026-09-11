@@ -1,34 +1,32 @@
-"""The /open slash command: claims a user's free periodic booster (subject
-to a per-server, per-booster-type cooldown), generates the pack via
-utils/packs.py, records it into their collection, and presents the result
-as a one-card-at-a-time flip-through view."""
+"""The /ripbooster and /ripcollector slash commands: claim a user's free
+periodic booster (subject to a per-server, per-booster-type cooldown),
+generate the pack via utils/packs.py, record it into their collection, and
+present the result as a one-card-at-a-time flip-through view.
+
+The two commands are identical except for which booster type they open —
+that's baked into the command itself (see Packs.ripbooster/ripcollector)
+rather than being an input field, so opening a Collector Booster is just
+`/ripcollector` instead of `/open booster_type:Collector Booster`.
+"""
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-import config
 from utils import database, packs, sets
 from utils.packs import BOOSTER_LABELS, RARITY_EMOJI
 from utils.views import SafeView
-
-BOOSTER_CHOICES = [
-    app_commands.Choice(name="Play Booster", value="play"),
-    app_commands.Choice(name="Collector Booster", value="collector"),
-]
 
 PACK_VIEW_TIMEOUT_SECONDS = 300
 
 
 def _card_title(card: packs.PulledCard) -> str:
     """Rarity emoji + name, with cosmetic emoji suffixes for any special
-    treatment this particular pull got (special-treatment printing, foil,
-    or a bonus pull from a linked Commander deck)."""
+    treatment this particular pull got (special-treatment printing, or a
+    bonus pull from a linked Commander deck)."""
     title = f"{RARITY_EMOJI.get(card.rarity, '')} {card.name}"
     if card.special:
         title += " 🎨"
-    if card.foil:
-        title += " ✨"
     if card.bonus:
         title += " 🎁"
     return title
@@ -97,10 +95,10 @@ async def resolve_set_or_report(interaction: discord.Interaction, query: str):
 
     Passes exclude_commander=True — a set-specific Commander deck (e.g.
     "Tarkir: Dragonstorm Commander") has no booster of its own (see the
-    commander-set_type check further down in open_pack), so if a user's
-    query fuzzy-matches both a base set and its Commander deck, only the
-    base set should be offered here rather than an ambiguous "did you
-    mean" prompt between an openable and a non-openable set.
+    commander-set_type check further down in _rip), so if a user's query
+    fuzzy-matches both a base set and its Commander deck, only the base set
+    should be offered here rather than an ambiguous "did you mean" prompt
+    between an openable and a non-openable set.
     """
     try:
         return await sets.resolve_set(query, exclude_commander=True)
@@ -109,47 +107,52 @@ async def resolve_set_or_report(interaction: discord.Interaction, query: str):
         return None
 
 
+async def resolve_set_or_random(interaction: discord.Interaction, set_query: str | None):
+    """Resolve the set to open: the user's explicit `set_query` if given,
+    otherwise a uniformly random pick among sets that are actually
+    openable — not a Commander deck, and with cards already cached (see
+    database.get_random_open_eligible_set). Reports a friendly error and
+    returns None on failure; caller should return immediately in that case.
+    """
+    if set_query:
+        return await resolve_set_or_report(interaction, set_query)
+
+    set_row = await database.get_random_open_eligible_set()
+    if set_row is None:
+        await interaction.followup.send(
+            "No sets are cached to open yet — ask an admin to run `python scripts/sync_sets.py` "
+            "and `python scripts/sync_all_cards.py` first."
+        )
+        return None
+    return set_row
+
+
 class Packs(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
-    @app_commands.command(name="open", description="Open your free periodic booster pack.")
-    @app_commands.describe(
-        set_query="Set name or code, e.g. mh3 or 'Modern Horizons 3'",
-        booster_type="Which booster (Play: every 4h, Collector: every 8h)",
-    )
-    @app_commands.rename(set_query="set")
-    @app_commands.choices(booster_type=BOOSTER_CHOICES)
-    @app_commands.guild_only()
-    async def open_pack(
-        self,
-        interaction: discord.Interaction,
-        set_query: str | None = None,
-        booster_type: app_commands.Choice[str] | None = None,
-    ) -> None:
-        """Open one free booster pack for the calling user in this server.
+    async def _rip(self, interaction: discord.Interaction, set_query: str | None, booster_value: str) -> None:
+        """Shared implementation behind /ripbooster and /ripcollector —
+        only the booster type differs between the two commands.
 
         Order of checks, each of which can end the command early:
-        1. A set must be resolvable (explicit `set_query`, or the server's
-           configured DEFAULT_SET_CODE).
+        1. A set must be resolvable: the explicit `set_query`, or else a
+           random openable set (see resolve_set_or_random).
         2. The resolved set must not itself be a Commander deck — those
            redirect the user to open Collector Boosters of the base set.
-        3. The set must actually have cards cached in the database.
+           (Only reachable when `set_query` names one explicitly — a random
+           pick already excludes Commander decks.)
+        3. The set must actually have cards cached in the database. (Also
+           only reachable via an explicit `set_query` — a random pick is
+           already guaranteed to be cached.)
         4. The user must not still be on cooldown for this booster type.
 
         Only once all four pass does it actually generate the pack and
         record it into the user's collection.
         """
-        query = set_query or config.DEFAULT_SET_CODE
-        if not query:
-            await interaction.response.send_message("Specify a set, e.g. `/open set:mh3`.", ephemeral=True)
-            return
-
-        booster_value = booster_type.value if booster_type else "play"
-
         await interaction.response.defer()
 
-        set_row = await resolve_set_or_report(interaction, query)
+        set_row = await resolve_set_or_random(interaction, set_query)
         if set_row is None:
             return
         set_code, set_name = set_row["code"], set_row["name"]
@@ -163,8 +166,7 @@ class Packs(commands.Cog):
             parent_name = parent["name"] if parent else "its base set"
             await interaction.followup.send(
                 f"{set_name} doesn't have its own booster — it's a Commander deck. Its cards show up as a rare "
-                f"bonus pull in {parent_name}'s Collector Boosters instead (`/open set:{set_row['parent_set_code']} "
-                f"booster_type:Collector Booster`)."
+                f"bonus pull in {parent_name}'s Collector Boosters instead (`/ripcollector set:{set_row['parent_set_code']}`)."
             )
             return
 
@@ -194,6 +196,20 @@ class Packs(commands.Cog):
         header = f"{interaction.user.display_name}'s {set_name} {BOOSTER_LABELS[booster_value]}"
         view = PackRevealView(interaction.user.id, header, pulled)
         await interaction.followup.send(embed=view.current_embed(), view=view)
+
+    @app_commands.command(name="ripbooster", description="Open your free periodic Play Booster (every 4h).")
+    @app_commands.describe(set_query="Set name or code, e.g. mh3 or 'Modern Horizons 3' — omit for a random set")
+    @app_commands.rename(set_query="set")
+    @app_commands.guild_only()
+    async def ripbooster_cmd(self, interaction: discord.Interaction, set_query: str | None = None) -> None:
+        await self._rip(interaction, set_query, "play")
+
+    @app_commands.command(name="ripcollector", description="Open your free periodic Collector Booster (every 8h).")
+    @app_commands.describe(set_query="Set name or code, e.g. mh3 or 'Modern Horizons 3' — omit for a random set")
+    @app_commands.rename(set_query="set")
+    @app_commands.guild_only()
+    async def ripcollector_cmd(self, interaction: discord.Interaction, set_query: str | None = None) -> None:
+        await self._rip(interaction, set_query, "collector")
 
 
 async def setup(bot: commands.Bot) -> None:

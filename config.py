@@ -25,9 +25,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 # an hour). See Urza.setup_hook in bot.py.
 DEV_GUILD_ID = os.getenv("DEV_GUILD_ID") or None
 
-# Set code /open falls back to when the user doesn't pass one explicitly.
-DEFAULT_SET_CODE = (os.getenv("DEFAULT_SET_CODE") or "").lower() or None
-
 # How often each user can claim a free booster pack, per server. See
 # utils/database.py's PACK_COOLDOWNS and claim_free_pack.
 PACK_COOLDOWN_PLAY_SECONDS = int(os.getenv("PACK_COOLDOWN_PLAY_SECONDS", 4 * 3600))
