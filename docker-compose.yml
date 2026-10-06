@@ -1,0 +1,8 @@
+# Convenience wrapper around `docker build` + `docker run`. There's no
+# database service here on purpose — this bot talks to an external managed
+# Postgres (Neon/Supabase) via DATABASE_URL, not a local Postgres container.
+services:
+  bot:
+    build: .
+    env_file: .env
+    restart: unless-stopped

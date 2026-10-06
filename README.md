@@ -121,6 +121,27 @@ scripts/                One-off/periodic maintenance scripts, run manually via `
    time), loads each cog in `EXTENSIONS`, and syncs slash commands (to
    `DEV_GUILD_ID` if set, otherwise globally).
 
+   **Or with Docker**, once `.env` is filled in (step 4) and card data is
+   loaded (step 5 — run those scripts on the host, against the same
+   `DATABASE_URL`, since they're one-off maintenance tasks rather than part
+   of the bot's own process):
+
+   ```bash
+   docker compose up --build -d   # build the image and run the bot in the background
+   docker compose logs -f         # follow logs
+   docker compose down            # stop it
+   ```
+
+   This builds from the included `Dockerfile` and reads `.env` via
+   `docker-compose.yml`'s `env_file`. There's no database container —
+   `DATABASE_URL` still points at your external Neon/Supabase Postgres.
+   Without Compose, the equivalent is:
+
+   ```bash
+   docker build -t urza-bot .
+   docker run -d --name urza-bot --env-file .env --restart unless-stopped urza-bot
+   ```
+
 ## How booster packs work
 
 See `utils/packs.py` for the exact odds; in short:
