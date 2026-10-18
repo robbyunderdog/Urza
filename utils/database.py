@@ -25,11 +25,9 @@ SCHEMA_PATH = Path(__file__).resolve().parent.parent / "db" / "schema.sql"
 # distinguishable by border_color, so every special-treatment check below
 # also checks border_color = 'borderless' independently.
 SPECIAL_TREATMENT_FRAMES = ["extendedart", "showcase", "inverted"]
-_SPECIAL_TREATMENT_SQL = "(frame_effects && {0}::text[] OR border_color = 'borderless')"
-# What pack opening flags with an emoji: special treatments plus full art
-# (which _SPECIAL_TREATMENT_SQL leaves out, since /tradeup's base-printing
-# filter shouldn't exclude full-art cards).
-_IS_SPECIAL_SQL = "(frame_effects && {0}::text[] OR border_color = 'borderless' OR full_art)"
+# What gets flagged with an emoji when pulled (packs and trade-ups), and
+# what trade-ups spend last: special treatments plus full art.
+_IS_SPECIAL_SQL = "(frame_effects && {0}::text[] OR border_color IS NOT DISTINCT FROM 'borderless' OR full_art)"
 
 _pool: asyncpg.Pool | None = None
 
@@ -142,33 +140,22 @@ async def set_is_cached(set_code: str) -> bool:
     return await pool.fetchval("SELECT EXISTS (SELECT 1 FROM cards WHERE set_code = $1)", set_code)
 
 
-async def get_random_cards(
-    set_code: str,
-    rarity: str | list[str],
-    count: int,
-    exclude_basic_land: bool = False,
-    exclude_special_treatment: bool = False,
-) -> list[asyncpg.Record]:
-    """Draw random printings. exclude_special_treatment=True restricts to
-    "base" printings (no extended-art/showcase frame). Used by /tradeup;
-    pack opening draws from get_pack_rows instead."""
-    rarities = [rarity] if isinstance(rarity, str) else list(rarity)
-    query = (
-        "SELECT id, oracle_id, name, rarity, image_url FROM cards "
-        "WHERE set_code = $1 AND rarity = ANY($2::text[])"
-    )
-    params: list = [set_code, rarities]
-    if exclude_basic_land:
-        query += " AND is_basic_land = FALSE"
-    if exclude_special_treatment:
-        placeholder = f"${len(params) + 1}"
-        query += f" AND NOT {_SPECIAL_TREATMENT_SQL.format(placeholder)}"
-        params.append(SPECIAL_TREATMENT_FRAMES)
-    query += f" ORDER BY RANDOM() LIMIT ${len(params) + 1}"
-    params.append(count)
-
+async def get_tradeup_card(set_code: str, rarity: str) -> asyncpg.Record | None:
+    """One random non-basic-land printing of `rarity` from this set (every
+    printing equally likely, alternate art included — same pool as packs),
+    or None if the set has none. Used by /tradeup."""
     pool = _get_pool()
-    return await pool.fetch(query, *params)
+    return await pool.fetchrow(
+        f"""
+        SELECT id, name, rarity, image_url, {_IS_SPECIAL_SQL.format("$3")} AS is_special
+        FROM cards
+        WHERE set_code = $1 AND rarity = $2 AND is_basic_land = FALSE
+        ORDER BY RANDOM() LIMIT 1
+        """,
+        set_code,
+        rarity,
+        SPECIAL_TREATMENT_FRAMES,
+    )
 
 
 async def get_available_rarities(set_code: str) -> set[str]:
@@ -419,9 +406,48 @@ async def find_owned_card_by_name(
     )
 
 
+async def get_tradeup_spares(guild_id: int, user_id: int, next_rarity: dict[str, str]) -> list[asyncpg.Record]:
+    """For every set this user has any spare copies in, one row per rarity
+    in `next_rarity` (rarity -> the one it trades up into): set_code,
+    set_name, rarity, spare (copies beyond the first, basic lands excluded;
+    0 if none), and possible (whether the set has any card of the next
+    rarity at all — e.g. no mythics before 2008). One round trip for the
+    whole /tradeup menu."""
+    pool = _get_pool()
+    return await pool.fetch(
+        """
+        WITH spare AS (
+            SELECT cards.set_code, cards.rarity, SUM(collection.quantity - 1)::int AS spare
+            FROM collection
+            JOIN cards ON cards.id = collection.card_id
+            WHERE collection.guild_id = $1 AND collection.user_id = $2
+              AND collection.quantity > 1 AND cards.is_basic_land = FALSE
+            GROUP BY cards.set_code, cards.rarity
+        ), step AS (
+            SELECT * FROM unnest($3::text[], $4::text[]) AS step(rarity, next_rarity)
+        )
+        SELECT owned.set_code, COALESCE(sets.name, UPPER(owned.set_code)) AS set_name,
+               step.rarity, COALESCE(spare.spare, 0) AS spare,
+               EXISTS (
+                   SELECT 1 FROM cards
+                   WHERE cards.set_code = owned.set_code AND cards.rarity = step.next_rarity
+                     AND cards.is_basic_land = FALSE
+               ) AS possible
+        FROM (SELECT DISTINCT set_code FROM spare) AS owned
+        CROSS JOIN step
+        LEFT JOIN spare ON spare.set_code = owned.set_code AND spare.rarity = step.rarity
+        LEFT JOIN sets ON sets.code = owned.set_code
+        """,
+        guild_id,
+        user_id,
+        list(next_rarity.keys()),
+        list(next_rarity.values()),
+    )
+
+
 async def count_spendable_duplicates(guild_id: int, user_id: int, set_code: str, rarity: str) -> int:
     """How many duplicate copies (quantity beyond the first) of a given
-    set+rarity this user could spend trading up."""
+    set+rarity this user could spend trading up. Basic lands don't count."""
     pool = _get_pool()
     total = await pool.fetchval(
         """
@@ -430,6 +456,7 @@ async def count_spendable_duplicates(guild_id: int, user_id: int, set_code: str,
         JOIN cards ON cards.id = collection.card_id
         WHERE collection.guild_id = $1 AND collection.user_id = $2
           AND cards.set_code = $3 AND cards.rarity = $4 AND collection.quantity > 1
+          AND cards.is_basic_land = FALSE
         """,
         guild_id,
         user_id,
@@ -439,51 +466,72 @@ async def count_spendable_duplicates(guild_id: int, user_id: int, set_code: str,
     return total or 0
 
 
-async def spend_duplicates(guild_id: int, user_id: int, set_code: str, rarity: str, amount: int) -> int:
+async def trade_up_duplicates(
+    guild_id: int, user_id: int, set_code: str, rarity: str, amount: int, award_card_id: int
+) -> bool:
     """Atomically spend exactly `amount` duplicate copies of a given
-    set+rarity from a user's collection, or none at all if there aren't
-    enough — never a partial spend (the sufficiency check and the spend
-    happen under the same row lock, closing the race where a concurrent
-    call could take duplicates out from under a check that already passed).
-    Returns `amount` on success or 0 if there weren't enough."""
+    set+rarity and add `award_card_id` to the collection — or do nothing at
+    all if there aren't enough. The check, the spend and the award share one
+    transaction under a row lock, so a concurrent call can't take duplicates
+    out from under a check that already passed, and a failure can't spend
+    the duplicates without awarding the card.
+
+    Basic lands are never spent. Plain printings go first, then alternate
+    art (see _IS_SPECIAL_SQL), each from the most-duplicated card down, so
+    nobody loses a borderless copy while they have plain ones to spare."""
     pool = _get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT collection.card_id, collection.quantity
                 FROM collection
                 JOIN cards ON cards.id = collection.card_id
                 WHERE collection.guild_id = $1 AND collection.user_id = $2
                   AND cards.set_code = $3 AND cards.rarity = $4 AND collection.quantity > 1
-                ORDER BY collection.quantity DESC
+                  AND cards.is_basic_land = FALSE
+                ORDER BY {_IS_SPECIAL_SQL.format("$5")}, collection.quantity DESC
                 FOR UPDATE OF collection
                 """,
                 guild_id,
                 user_id,
                 set_code,
                 rarity,
+                SPECIAL_TREATMENT_FRAMES,
             )
-            available = sum(row["quantity"] - 1 for row in rows)
-            if available < amount:
-                return 0
+            if sum(row["quantity"] - 1 for row in rows) < amount:
+                return False
 
+            spend: dict[int, int] = {}
             remaining = amount
             for row in rows:
                 if remaining <= 0:
                     break
                 take = min(row["quantity"] - 1, remaining)
-                if take <= 0:
-                    continue
-                await conn.execute(
-                    "UPDATE collection SET quantity = quantity - $1 WHERE guild_id = $2 AND user_id = $3 AND card_id = $4",
-                    take,
-                    guild_id,
-                    user_id,
-                    row["card_id"],
-                )
+                spend[row["card_id"]] = take
                 remaining -= take
-            return amount
+
+            await conn.execute(
+                """
+                UPDATE collection SET quantity = collection.quantity - t.take
+                FROM unnest($3::int[], $4::int[]) AS t(card_id, take)
+                WHERE collection.guild_id = $1 AND collection.user_id = $2 AND collection.card_id = t.card_id
+                """,
+                guild_id,
+                user_id,
+                list(spend.keys()),
+                list(spend.values()),
+            )
+            await conn.execute(
+                """
+                INSERT INTO collection (guild_id, user_id, card_id, quantity) VALUES ($1, $2, $3, 1)
+                ON CONFLICT (guild_id, user_id, card_id) DO UPDATE SET quantity = collection.quantity + 1
+                """,
+                guild_id,
+                user_id,
+                award_card_id,
+            )
+            return True
 
 
 async def get_set_progress(guild_id: int, user_id: int, set_code: str) -> dict[str, tuple[int, int]]:

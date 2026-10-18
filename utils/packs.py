@@ -40,6 +40,9 @@ RARITY_EMOJI = {
 
 RARITY_ORDER = {"mythic": 0, "rare": 1, "uncommon": 2, "common": 3}
 
+# Shown after the name of an alternate-art printing (PulledCard.special).
+SPECIAL_EMOJI = "🎨"
+
 # Key under which the pack cooldown is stored in pack_cooldowns.booster_type.
 PACK_TYPE = "pack"
 
@@ -59,6 +62,12 @@ class PulledCard:
     image_url: str | None
     special: bool = False  # extended art / showcase / borderless / full art
     set_code: str | None = None  # used to file the image cache by set (utils/pack_image.py)
+
+
+def card_line(card: PulledCard) -> str:
+    """Rarity emoji + name, plus SPECIAL_EMOJI for an alternate-art printing."""
+    line = f"{RARITY_EMOJI.get(card.rarity, '')} {card.name}"
+    return f"{line} {SPECIAL_EMOJI}" if card.special else line
 
 
 def _weighted_rarity(weights: dict[str, int]) -> str:

@@ -14,7 +14,7 @@ directly — only the sync scripts do.
 | `/rip [set]` | Opens your free periodic pack, adds the pulled cards to your collection, and shows the whole pack as one image ("View cards" flips through it full-size). Omit `set` for a random eligible set. |
 | `/collection [set]` | With no `set`: paginated overview of your progress across every cached set. With `set`: a per-rarity breakdown for that one set. |
 | `/missing [set] [rarity]` | With no `set`: total missing cards and overall completion % across every cached set. With `set`: lists exactly which cards you're missing (optionally filtered to one rarity). |
-| `/tradeup <set> <rarity>` | Spends duplicate copies of one rarity for a random card of the next rarity up. |
+| `/tradeup [set]` | Spend 10 duplicates of one rarity in a set for a random card of the next rarity up. Opens a private menu of the sets you can afford a trade-up in (most first), then which rarity to spend. Basic lands don't count, and alternate-art copies are spent last. |
 | `/ping` | Health check — replies with the bot's gateway latency. |
 
 Collections, cooldowns, and trades are all scoped **per Discord server**

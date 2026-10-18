@@ -12,7 +12,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from utils import database, pack_image, packs, sets
-from utils.packs import PACK_TYPE, RARITY_EMOJI
+from utils.packs import PACK_TYPE, card_line
 from utils.views import SafeView
 
 PACK_VIEW_TIMEOUT_SECONDS = 300
@@ -42,7 +42,7 @@ class PackRevealView(SafeView):
         """Render the card at `self.index` as the embed the view currently
         shows. Called both for the initial message and after every ◀/▶ click."""
         card = self.pulled[self.index]
-        embed = discord.Embed(title=_card_line(card), description=card.rarity.capitalize(), color=discord.Color.blurple())
+        embed = discord.Embed(title=card_line(card), description=card.rarity.capitalize(), color=discord.Color.blurple())
         if card.image_url:
             embed.set_image(url=card.image_url)
         embed.set_author(name=self.header)
@@ -66,15 +66,6 @@ class PackRevealView(SafeView):
         with no interaction, so a stale view doesn't accept clicks forever."""
         for child in self.children:
             child.disabled = True
-
-
-SPECIAL_EMOJI = "🎨"
-
-
-def _card_line(card: packs.PulledCard) -> str:
-    """Rarity emoji + name, plus SPECIAL_EMOJI for an alternate-art printing."""
-    line = f"{RARITY_EMOJI.get(card.rarity, '')} {card.name}"
-    return f"{line} {SPECIAL_EMOJI}" if card.special else line
 
 
 class PackGridView(SafeView):
@@ -110,7 +101,7 @@ async def send_pack(
     whole pack (see pack_image.render_pack_grid) with the card list above
     it, and a "View cards" button for a full-size card-by-card look.
     `pulled` must already be in display order (packs.sort_by_rarity)."""
-    embed = discord.Embed(description="\n".join(_card_line(card) for card in pulled), color=discord.Color.blurple())
+    embed = discord.Embed(description="\n".join(card_line(card) for card in pulled), color=discord.Color.blurple())
     embed.set_author(name=header)
     embed.set_image(url="attachment://pack.jpg")
     view = PackGridView(interaction.user.id, header, pulled)
