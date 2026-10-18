@@ -27,8 +27,7 @@ DEV_GUILD_ID = os.getenv("DEV_GUILD_ID") or None
 
 # How often each user can claim a free booster pack, per server. See
 # utils/database.py's PACK_COOLDOWNS and claim_free_pack.
-PACK_COOLDOWN_PLAY_SECONDS = int(os.getenv("PACK_COOLDOWN_PLAY_SECONDS", 4 * 3600))
-PACK_COOLDOWN_COLLECTOR_SECONDS = int(os.getenv("PACK_COOLDOWN_COLLECTOR_SECONDS", 8 * 3600))
+PACK_COOLDOWN_SECONDS = int(os.getenv("PACK_COOLDOWN_SECONDS", 4 * 3600))
 
 # Postgres connection pool bounds (see utils.database.init_db). Neon/Supabase
 # pooled endpoints comfortably support more than this default; raise it if

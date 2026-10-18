@@ -39,9 +39,9 @@ CREATE INDEX IF NOT EXISTS idx_cards_frame_effects ON cards USING GIN (frame_eff
 -- Set metadata, used to resolve free-text set names ("mh3", "Modern
 -- Horizons 3") to a set code. See utils/sets.py. parent_set_code links a
 -- set-specific Commander deck (set_type='commander') to its base expansion
--- (e.g. "Dominaria United Commander" -> "dmu") — those decks have no
--- booster of their own; their cards are a bonus pull from the base set's
--- Collector Boosters instead. The generic yearly "Commander 20XX" releases
+-- (e.g. "Dominaria United Commander" -> "dmu") — those decks are opened
+-- and completed as their own set; the link only decides which ones get
+-- synced. The generic yearly "Commander 20XX" releases
 -- have no parent_set_code and are excluded entirely (see utils/sets.py).
 CREATE TABLE IF NOT EXISTS sets (
     code TEXT PRIMARY KEY,
