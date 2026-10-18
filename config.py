@@ -38,6 +38,9 @@ IMAGE_CACHE_DIR = os.getenv("IMAGE_CACHE_DIR") or None
 # on startup and then again every this many hours (default weekly).
 IMAGE_CACHE_REFRESH_HOURS = float(os.getenv("IMAGE_CACHE_REFRESH_HOURS") or 7 * 24)
 
+# Custom status shown under the bot's name in the member list.
+BOT_STATUS = os.getenv("BOT_STATUS") or "🃏 Shuffling 70,000 cards"
+
 # Postgres connection pool bounds (see utils.database.init_db). Neon/Supabase
 # pooled endpoints comfortably support more than this default; raise it if
 # you deploy to many concurrent guilds and see pool-exhaustion warnings.

@@ -96,6 +96,7 @@ scripts/                One-off/periodic maintenance scripts, run manually via `
    | `PACK_COOLDOWN_SECONDS` | no | Override the free-pack cooldown (default: 4h). Handy to set to `0` while testing. |
    | `IMAGE_CACHE_DIR` | no | Directory to keep downloaded card images in, so repeat cards skip the Scryfall download. Unset = no cache. `docker-compose.yml` sets this itself. |
    | `IMAGE_CACHE_REFRESH_HOURS` | no | How often the bot downloads missing card images into `IMAGE_CACHE_DIR` (default: 168 = weekly; also runs on startup). |
+   | `BOT_STATUS` | no | Custom status shown under the bot's name in the member list (default: `🃏 Shuffling 70,000 cards`). |
    | `DB_POOL_MIN_SIZE` / `DB_POOL_MAX_SIZE` | no | Postgres connection pool sizing (defaults: 2 / 20). |
 
 5. **Load card data.** The database schema is created automatically the

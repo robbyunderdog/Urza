@@ -82,7 +82,14 @@ class Urza(commands.AutoShardedBot):
         # slash commands and button interactions, not message content or
         # member-list events, so no privileged intents need to be requested.
         intents = discord.Intents.default()
-        super().__init__(command_prefix=commands.when_mentioned, intents=intents)
+        # Passing the status here (rather than calling change_presence in
+        # on_ready) means it's sent with every gateway identify, so it
+        # survives reconnects without any extra code.
+        super().__init__(
+            command_prefix=commands.when_mentioned,
+            intents=intents,
+            activity=discord.CustomActivity(name=config.BOT_STATUS),
+        )
         self.tree.on_error = on_tree_error
 
     async def setup_hook(self) -> None:
