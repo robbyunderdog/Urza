@@ -9,7 +9,7 @@ below are grouped by the table(s) they touch: card cache, sets, collection,
 pack cooldowns, then trading.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from pathlib import Path
 
 import asyncpg
@@ -120,6 +120,20 @@ async def upsert_cards(rows: list[tuple]) -> int:
     return len(rows)
 
 
+async def get_image_urls(set_code: str | None = None) -> list[asyncpg.Record]:
+    """(set_code, image_url) for every cached printing that has an image,
+    optionally restricted to one set. Used by scripts/cache_card_images.py."""
+    pool = _get_pool()
+    return await pool.fetch(
+        """
+        SELECT set_code, image_url FROM cards
+        WHERE image_url IS NOT NULL AND ($1::text IS NULL OR set_code = $1)
+        ORDER BY set_code
+        """,
+        set_code.lower() if set_code else None,
+    )
+
+
 async def set_is_cached(set_code: str) -> bool:
     """Whether any card printing from `set_code` has been synced into the
     `cards` table — used to give a helpful "not cached yet" message instead
@@ -137,7 +151,7 @@ async def get_random_cards(
 ) -> list[asyncpg.Record]:
     """Draw random printings. exclude_special_treatment=True restricts to
     "base" printings (no extended-art/showcase frame). Used by /tradeup;
-    pack opening draws from get_random_pack_cards instead."""
+    pack opening draws from get_pack_rows instead."""
     rarities = [rarity] if isinstance(rarity, str) else list(rarity)
     query = (
         "SELECT id, oracle_id, name, rarity, image_url FROM cards "
@@ -160,7 +174,8 @@ async def get_random_cards(
 async def get_available_rarities(set_code: str) -> set[str]:
     """Which rarities have at least one non-basic-land printing cached
     for this set — i.e. which rarities a pack slot can actually draw
-    from (matches get_random_pack_cards's pool). Used to keep pack
+    from (matches get_pack_rows's pool). Empty if the set isn't cached.
+    utils/packs.py caches this in memory per set. Used to keep pack
     generation from ever rolling a rarity the pool doesn't have (e.g. no
     mythics in sets printed before 2008's Shards of Alara), which would
     otherwise silently shrink the pack by a card instead of drawing
@@ -173,38 +188,41 @@ async def get_available_rarities(set_code: str) -> set[str]:
     return {row["rarity"] for row in rows}
 
 
-async def get_random_pack_cards(set_code: str, rarity: str, count: int) -> list[asyncpg.Record]:
-    """Draw `count` distinct random non-basic-land printings of one rarity
-    from this set — every printing (alternate art included) has an equal
-    chance, so a pack's pool is the whole set. is_special flags alternate
-    art for display only (see _IS_SPECIAL_SQL)."""
+async def get_pack_rows(set_code: str, rarity_counts: dict[str, int]) -> list[asyncpg.Record]:
+    """Everything a pack needs in one round trip: for each rarity in
+    `rarity_counts`, up to that many distinct random non-basic-land
+    printings from this set (every printing, alternate art included, has an
+    equal chance), plus one basic land (preferring full art) if the set has
+    any. Rows carry is_land so the caller can tell the land apart, and
+    is_special flags alternate art for display only (see _IS_SPECIAL_SQL).
+
+    Fewer round trips matter more than query cost here: the database is
+    remote, so each trip costs ~85ms while the query itself is ~1ms."""
     pool = _get_pool()
     return await pool.fetch(
         f"""
-        SELECT id, name, rarity, image_url, {_IS_SPECIAL_SQL.format("$4")} AS is_special FROM cards
-        WHERE set_code = $1 AND rarity = $2 AND is_basic_land = FALSE
-        ORDER BY RANDOM() LIMIT $3
+        WITH want AS (
+            SELECT * FROM unnest($2::text[], $3::int[]) AS w(rarity, n)
+        ), ranked AS (
+            SELECT cards.id, cards.name, cards.rarity, cards.image_url,
+                   {_IS_SPECIAL_SQL.format("$4")} AS is_special,
+                   ROW_NUMBER() OVER (PARTITION BY cards.rarity ORDER BY RANDOM()) AS rn,
+                   want.n
+            FROM cards JOIN want ON want.rarity = cards.rarity
+            WHERE cards.set_code = $1 AND cards.is_basic_land = FALSE
+        ), land AS (
+            SELECT id, name, rarity, image_url, {_IS_SPECIAL_SQL.format("$4")} AS is_special
+            FROM cards
+            WHERE set_code = $1 AND is_basic_land = TRUE
+            ORDER BY full_art DESC, RANDOM() LIMIT 1
+        )
+        SELECT id, name, rarity, image_url, is_special, FALSE AS is_land FROM ranked WHERE rn <= n
+        UNION ALL
+        SELECT id, name, rarity, image_url, is_special, TRUE AS is_land FROM land
         """,
         set_code,
-        rarity,
-        count,
-        SPECIAL_TREATMENT_FRAMES,
-    )
-
-
-async def get_random_basic_lands(set_code: str, count: int) -> list[asyncpg.Record]:
-    """Prefers full-art printings when this set has any cached; falls back
-    to any basic land it has otherwise. Returns [] if the set has no basic
-    lands cached at all (e.g. Prophecy never printed its own)."""
-    pool = _get_pool()
-    return await pool.fetch(
-        f"""
-        SELECT id, name, rarity, image_url, {_IS_SPECIAL_SQL.format("$3")} AS is_special FROM cards
-        WHERE set_code = $1 AND is_basic_land = TRUE
-        ORDER BY full_art DESC, RANDOM() LIMIT $2
-        """,
-        set_code,
-        count,
+        list(rarity_counts.keys()),
+        list(rarity_counts.values()),
         SPECIAL_TREATMENT_FRAMES,
     )
 
@@ -334,8 +352,8 @@ async def add_to_collection(guild_id: int, user_id: int, card_ids: list[int]) ->
     """Add one or more printings to a user's per-server collection,
     incrementing quantity for any already owned. `card_ids` may contain
     duplicates (e.g. a booster pulling the same printing twice) — those are
-    collapsed into a single counted upsert per distinct card_id rather than
-    one row-locking round trip per individual card."""
+    collapsed into a single counted upsert per distinct card_id, all sent
+    as one statement (one round trip)."""
     counts: dict[int, int] = {}
     for card_id in card_ids:
         counts[card_id] = counts.get(card_id, 0) + 1
@@ -343,16 +361,18 @@ async def add_to_collection(guild_id: int, user_id: int, card_ids: list[int]) ->
         return
 
     pool = _get_pool()
-    async with pool.acquire() as conn:
-        await conn.executemany(
-            """
-            INSERT INTO collection (guild_id, user_id, card_id, quantity)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (guild_id, user_id, card_id)
-            DO UPDATE SET quantity = collection.quantity + EXCLUDED.quantity
-            """,
-            [(guild_id, user_id, card_id, qty) for card_id, qty in counts.items()],
-        )
+    await pool.execute(
+        """
+        INSERT INTO collection (guild_id, user_id, card_id, quantity)
+        SELECT $1, $2, card_id, qty FROM unnest($3::int[], $4::int[]) AS t(card_id, qty)
+        ON CONFLICT (guild_id, user_id, card_id)
+        DO UPDATE SET quantity = collection.quantity + EXCLUDED.quantity
+        """,
+        guild_id,
+        user_id,
+        list(counts.keys()),
+        list(counts.values()),
+    )
 
 
 async def get_collection(guild_id: int, user_id: int) -> list[asyncpg.Record]:
@@ -567,34 +587,38 @@ async def release_pack_claim(guild_id: int, user_id: int, booster_type: str) -> 
 
 async def claim_free_pack(guild_id: int, user_id: int, booster_type: str) -> timedelta | None:
     """Try to claim a free pack in this server. Returns None on success (and
-    records the claim), or the remaining wait time if still on cooldown."""
+    records the claim), or the remaining wait time if still on cooldown.
+
+    One statement, so one round trip: the upsert only overwrites
+    last_opened_at when the cooldown has passed, and ON CONFLICT ... WHERE
+    takes the row lock itself, so two simultaneous claims can't both win.
+    The outer SELECT reads the snapshot from before the upsert, so `last`
+    is the previous claim time — exactly what's needed for the remaining
+    wait when the claim didn't go through."""
     pool = _get_pool()
     cooldown = PACK_COOLDOWNS[booster_type]
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            last = await conn.fetchval(
-                "SELECT last_opened_at FROM pack_cooldowns WHERE guild_id = $1 AND user_id = $2 AND booster_type = $3 FOR UPDATE",
-                guild_id,
-                user_id,
-                booster_type,
-            )
-            now = datetime.now(timezone.utc)
-            if last is not None:
-                remaining = cooldown - (now - last)
-                if remaining > timedelta(0):
-                    return remaining
-            await conn.execute(
-                """
-                INSERT INTO pack_cooldowns (guild_id, user_id, booster_type, last_opened_at)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (guild_id, user_id, booster_type) DO UPDATE SET last_opened_at = EXCLUDED.last_opened_at
-                """,
-                guild_id,
-                user_id,
-                booster_type,
-                now,
-            )
-            return None
+    row = await pool.fetchrow(
+        """
+        WITH claim AS (
+            INSERT INTO pack_cooldowns (guild_id, user_id, booster_type, last_opened_at)
+            VALUES ($1, $2, $3, now())
+            ON CONFLICT (guild_id, user_id, booster_type) DO UPDATE SET last_opened_at = EXCLUDED.last_opened_at
+            WHERE pack_cooldowns.last_opened_at <= now() - $4::interval
+            RETURNING 1
+        )
+        SELECT EXISTS (SELECT 1 FROM claim) AS claimed,
+               (SELECT last_opened_at FROM pack_cooldowns
+                WHERE guild_id = $1 AND user_id = $2 AND booster_type = $3) AS last,
+               now() AS now
+        """,
+        guild_id,
+        user_id,
+        booster_type,
+        cooldown,
+    )
+    if row["claimed"]:
+        return None
+    return cooldown - (row["now"] - row["last"])
 
 
 # ---------------------------------------------------------------------------

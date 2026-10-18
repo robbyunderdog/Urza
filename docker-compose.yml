@@ -6,3 +6,11 @@ services:
     build: .
     env_file: .env
     restart: unless-stopped
+    environment:
+      # Card image cache (see utils/pack_image.py), on the volume below. The
+      # bot fills it on startup and then weekly (IMAGE_CACHE_REFRESH_HOURS).
+      IMAGE_CACHE_DIR: /data/card-images
+    volumes:
+      # Host path of the cache. On the Proxmox VM this is the TrueNAS share;
+      # change it to any writable directory when running elsewhere.
+      - ${IMAGE_CACHE_HOST_DIR:-/mnt/truenas-share/data/urza/card-images}:/data/card-images

@@ -4,6 +4,7 @@ their collection, and present the result as one grid image of the whole
 pack (see utils/pack_image.py), with an optional card-by-card view.
 """
 
+import asyncio
 import io
 
 import discord
@@ -102,12 +103,13 @@ class PackGridView(SafeView):
             child.disabled = True
 
 
-async def send_pack(interaction: discord.Interaction, header: str, pulled: list[packs.PulledCard]) -> None:
-    """Send an opened pack as a followup: one composited grid image of the
-    whole pack (rarest first) with the card list above it, and a "View
-    cards" button for a full-size card-by-card look."""
-    pulled = packs.sort_by_rarity(pulled)
-    image = await pack_image.render_pack_grid(pulled)
+async def send_pack(
+    interaction: discord.Interaction, header: str, pulled: list[packs.PulledCard], image: bytes
+) -> None:
+    """Send an opened pack as a followup: the composited grid image of the
+    whole pack (see pack_image.render_pack_grid) with the card list above
+    it, and a "View cards" button for a full-size card-by-card look.
+    `pulled` must already be in display order (packs.sort_by_rarity)."""
     embed = discord.Embed(description="\n".join(_card_line(card) for card in pulled), color=discord.Color.blurple())
     embed.set_author(name=header)
     embed.set_image(url="attachment://pack.jpg")
@@ -157,7 +159,7 @@ class Packs(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
-    @app_commands.command(name="rip", description="Open your free periodic pack (every 4h).")
+    @app_commands.command(name="rip", description="Open your free periodic pack.")
     @app_commands.describe(set_query="Set name or code, e.g. mh3 or 'Modern Horizons 3' — omit for a random set")
     @app_commands.rename(set_query="set")
     @app_commands.guild_only()
@@ -165,7 +167,8 @@ class Packs(commands.Cog):
         """Order of checks, each of which can end the command early:
         1. A set must be resolvable: the explicit `set_query`, or else a
            random openable set (see resolve_set_or_random).
-        2. The set must actually have cards cached in the database. (Also
+        2. The set must actually have cards cached in the database (via
+           packs.available_rarities, which is cached in memory). (Also
            only reachable via an explicit `set_query` — a random pick is
            already guaranteed to be cached.)
         3. The user must not still be on cooldown.
@@ -180,7 +183,7 @@ class Packs(commands.Cog):
             return
         set_code, set_name = set_row["code"], set_row["name"]
 
-        if not await database.set_is_cached(set_code):
+        if not await packs.available_rarities(set_code):
             await interaction.followup.send(
                 f"No cards cached for {set_name} ({set_code}) yet — ask an admin to run "
                 f"`python scripts/sync_set.py {set_code}` first."
@@ -192,17 +195,24 @@ class Packs(commands.Cog):
             await interaction.followup.send(f"Your next free pack is ready in {_format_remaining(remaining)}.")
             return
 
+        # The cooldown is already claimed at this point — if anything below
+        # fails before the cards are recorded, give the claim back rather
+        # than silently costing the user their free pack for a transient
+        # failure. Rendering the image runs alongside the collection write,
+        # since neither depends on the other.
+        render = None
         try:
-            pulled = await packs.open_pack(interaction.guild_id, interaction.user.id, set_code)
+            pulled = packs.sort_by_rarity(await packs.generate_pack(set_code))
+            render = asyncio.create_task(pack_image.render_pack_grid(pulled))
+            await packs.record_pack(interaction.guild_id, interaction.user.id, pulled)
         except Exception:
-            # The cooldown was already claimed above — if generating the pack
-            # blew up partway through, give it back rather than silently
-            # costing the user their free pack for a transient failure.
+            if render is not None:
+                render.cancel()
             await database.release_pack_claim(interaction.guild_id, interaction.user.id, PACK_TYPE)
             raise
 
         header = f"{interaction.user.display_name}'s {set_name} pack"
-        await send_pack(interaction, header, pulled)
+        await send_pack(interaction, header, pulled, await render)
 
 
 async def setup(bot: commands.Bot) -> None:

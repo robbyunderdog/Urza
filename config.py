@@ -29,6 +29,15 @@ DEV_GUILD_ID = os.getenv("DEV_GUILD_ID") or None
 # utils/database.py's PACK_COOLDOWNS and claim_free_pack.
 PACK_COOLDOWN_SECONDS = int(os.getenv("PACK_COOLDOWN_SECONDS", 4 * 3600))
 
+# Directory to keep downloaded card images in (see utils/pack_image.py).
+# Unset = no disk cache; images are downloaded from Scryfall every time.
+# docker-compose.yml points this at a mounted volume.
+IMAGE_CACHE_DIR = os.getenv("IMAGE_CACHE_DIR") or None
+
+# When IMAGE_CACHE_DIR is set, the bot downloads every missing card image
+# on startup and then again every this many hours (default weekly).
+IMAGE_CACHE_REFRESH_HOURS = float(os.getenv("IMAGE_CACHE_REFRESH_HOURS") or 7 * 24)
+
 # Postgres connection pool bounds (see utils.database.init_db). Neon/Supabase
 # pooled endpoints comfortably support more than this default; raise it if
 # you deploy to many concurrent guilds and see pool-exhaustion warnings.

@@ -20,9 +20,10 @@ import logging
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 import config
+from utils import pack_image
 from utils.database import close_db, init_db
 
 logging.basicConfig(level=logging.INFO)
@@ -58,6 +59,20 @@ async def on_tree_error(interaction: discord.Interaction, error: app_commands.Ap
         pass  # interaction token may already be invalid/expired — nothing more we can do
 
 
+@tasks.loop(hours=config.IMAGE_CACHE_REFRESH_HOURS)
+async def refresh_image_cache() -> None:
+    """Download any card images missing from the disk cache. A tasks.loop
+    runs its first iteration as soon as it's started, so this covers both
+    "on launch" and "every IMAGE_CACHE_REFRESH_HOURS". After the first full
+    run it only fetches what's new, so restarts are cheap. Failures are
+    logged rather than raised — an unhandled exception would stop the loop
+    for good."""
+    try:
+        await pack_image.fill_cache()
+    except Exception:
+        log.exception("Image cache refresh failed")
+
+
 class Urza(commands.AutoShardedBot):
     """The bot itself. Auto-sharded so it scales past the ~2,500-guild
     single-shard limit without code changes if this ever grows that large."""
@@ -78,6 +93,9 @@ class Urza(commands.AutoShardedBot):
 
         for extension in EXTENSIONS:
             await self.load_extension(extension)
+
+        if config.IMAGE_CACHE_DIR:
+            refresh_image_cache.start()
 
         if config.DEV_GUILD_ID:
             # Copies every globally-registered command into this one guild
@@ -108,8 +126,11 @@ class Urza(commands.AutoShardedBot):
         log.exception("Unhandled error in event %s", event_method)
 
     async def close(self) -> None:
-        """Ensures the Postgres pool is closed cleanly on shutdown (Ctrl+C,
-        SIGTERM, etc.) before delegating to discord.py's own cleanup."""
+        """Ensures the Postgres pool and the shared Scryfall HTTP session are
+        closed cleanly on shutdown (Ctrl+C, SIGTERM, etc.) before delegating
+        to discord.py's own cleanup."""
+        refresh_image_cache.cancel()
+        await pack_image.close()
         await close_db()
         await super().close()
 

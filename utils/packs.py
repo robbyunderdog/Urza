@@ -14,9 +14,9 @@ cross-set bonus pool. A pack is built like this:
    PACK_RARITY_WEIGHTS — filtered down to rarities the pool actually has
    any cards of, so a set missing a whole rarity (e.g. no mythics in sets
    printed before 2008) never rolls a slot it can't fill.
-2. Fetch random printings for each distinct rarity actually needed — one
-   query per rarity, not per card.
-3. Add exactly one basic land as the 15th card (preferring full-art), if
+2. Fetch random printings for every slot, plus the land, in a single
+   query (see database.get_pack_rows).
+3. Include exactly one basic land as the 15th card (preferring full-art), if
    the set has any basic lands cached at all — some small/old sets never
    printed their own (e.g. Prophecy), in which case the pack is 14 cards.
 
@@ -25,7 +25,8 @@ odds.
 """
 
 import random
-from collections import Counter
+import time
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 
 from utils import database
@@ -57,6 +58,7 @@ class PulledCard:
     rarity: str
     image_url: str | None
     special: bool = False  # extended art / showcase / borderless / full art
+    set_code: str | None = None  # used to file the image cache by set (utils/pack_image.py)
 
 
 def _weighted_rarity(weights: dict[str, int]) -> str:
@@ -68,65 +70,64 @@ def _weighted_rarity(weights: dict[str, int]) -> str:
 
 def _filtered_weights(weights: dict[str, int], available: set[str]) -> dict[str, int]:
     """Restrict a rarity-weight table to rarities the pool actually has
-    cards for (see database.get_available_rarities), so _weighted_rarity can
-    never roll a rarity that would just come back empty and silently shrink
-    the pack by a slot. Falls back to the unfiltered weights in the
-    (should-be-unreachable, since set_is_cached is already checked before a
-    pack is opened) case where the pool is empty — the empty-group skip in
-    _build_pack is the backstop."""
+    cards for (see available_rarities), so _weighted_rarity can never roll a
+    rarity that would just come back empty and silently shrink the pack by
+    a slot. Falls back to the unfiltered weights in the
+    (should-be-unreachable, since /rip checks available_rarities before
+    opening) case where the pool is empty — the empty-bucket skip in
+    generate_pack is the backstop."""
     filtered = {rarity: weight for rarity, weight in weights.items() if rarity in available}
     return filtered or weights
 
 
-async def _draw_land(set_code: str) -> PulledCard | None:
-    """Draw the pack's single basic-land slot, preferring a full-art
-    printing when this set has one cached. Returns None if the set has no
-    basic lands cached at all — some sets/products genuinely don't ship
-    one (e.g. Prophecy) — the caller simply omits the land rather than
-    substituting one from an unrelated set."""
-    rows = await database.get_random_basic_lands(set_code, 1)
-    if not rows:
-        return None
-    row = rows[0]
-    return PulledCard(row["id"], row["name"], row["rarity"], row["image_url"], row["is_special"])
+# Which rarities each set has, per set_code. Card data only changes when an
+# admin runs a sync script, so this is cached in memory (same TTL idea as
+# utils/sets.py) to save a database round trip on every /rip.
+_RARITY_CACHE_TTL_SECONDS = 600
+_rarity_cache: dict[str, tuple[float, set[str]]] = {}
 
 
-async def _build_pack(set_code: str) -> list[PulledCard]:
-    """Build a 15-card pack: 14 independently-rolled cards from every
-    printing in the set, plus one basic land (omitted if the set has none
-    cached)."""
-    available = await database.get_available_rarities(set_code)
-    weights = _filtered_weights(PACK_RARITY_WEIGHTS, available)
-    rarities = [_weighted_rarity(weights) for _ in range(PACK_CARD_COUNT)]
+async def available_rarities(set_code: str) -> set[str]:
+    """Rarities with at least one non-basic printing cached for this set —
+    empty if the set has no cards cached at all, so this doubles as the
+    "is this set openable" check."""
+    now = time.monotonic()
+    cached = _rarity_cache.get(set_code)
+    if cached is None or now - cached[0] > _RARITY_CACHE_TTL_SECONDS:
+        cached = (now, await database.get_available_rarities(set_code))
+        _rarity_cache[set_code] = cached
+    return cached[1]
 
-    rows_by_rarity = {
-        rarity: await database.get_random_pack_cards(set_code, rarity, count)
-        for rarity, count in Counter(rarities).items()
-    }
-    pointers: dict[str, int] = {}
 
-    pulled: list[PulledCard] = []
-    for rarity in rarities:
-        pointer = pointers.get(rarity, 0)
-        rows = rows_by_rarity[rarity]
-        if pointer >= len(rows):
-            continue  # not enough distinct cards of that rarity cached — skip this slot
-        pointers[rarity] = pointer + 1
-        row = rows[pointer]
-        pulled.append(PulledCard(row["id"], row["name"], row["rarity"], row["image_url"], row["is_special"]))
-
-    land = await _draw_land(set_code)
-    if land:
-        pulled.append(land)
-
-    return pulled
+def _to_card(row, set_code: str) -> PulledCard:
+    return PulledCard(row["id"], row["name"], row["rarity"], row["image_url"], row["is_special"], set_code)
 
 
 async def generate_pack(set_code: str) -> list[PulledCard]:
-    """Generate one pack of `set_code` without recording it anywhere — used
-    by open_pack; handy on its own for showing a pack without giving the
-    cards to anyone."""
-    return await _build_pack(set_code)
+    """Generate one 15-card pack of `set_code` without recording it
+    anywhere: 14 independently-rolled cards from every printing in the set,
+    plus one basic land (omitted if the set has none cached). One database
+    round trip — see database.get_pack_rows."""
+    weights = _filtered_weights(PACK_RARITY_WEIGHTS, await available_rarities(set_code))
+    rarities = [_weighted_rarity(weights) for _ in range(PACK_CARD_COUNT)]
+    rows = await database.get_pack_rows(set_code, dict(Counter(rarities)))
+
+    buckets: dict[str, list] = defaultdict(list)
+    land = None
+    for row in rows:
+        if row["is_land"]:
+            land = row
+        else:
+            buckets[row["rarity"]].append(row)
+
+    pulled: list[PulledCard] = []
+    for rarity in rarities:
+        if not buckets[rarity]:
+            continue  # not enough distinct cards of that rarity cached — skip this slot
+        pulled.append(_to_card(buckets[rarity].pop(), set_code))
+    if land:
+        pulled.append(_to_card(land, set_code))
+    return pulled
 
 
 def sort_by_rarity(cards: list[PulledCard]) -> list[PulledCard]:
@@ -135,15 +136,8 @@ def sort_by_rarity(cards: list[PulledCard]) -> list[PulledCard]:
     return sorted(cards, key=lambda card: RARITY_ORDER.get(card.rarity, len(RARITY_ORDER)))
 
 
-async def open_pack(guild_id: int, user_id: int, set_code: str) -> list[PulledCard]:
-    """Open one pack of `set_code`, add every pulled card to the user's
-    per-server collection, and return the pulls (in pack order — the caller
-    doesn't need to re-sort them for display).
-
-    This is the only function in this module that touches the database for
-    anything other than reading — the actual collection write happens here,
-    once, after the whole pack has been generated.
-    """
-    pulled = await generate_pack(set_code)
+async def record_pack(guild_id: int, user_id: int, pulled: list[PulledCard]) -> None:
+    """Add every card in an opened pack to the user's per-server
+    collection. Kept separate from generate_pack so /rip can render the
+    pack image at the same time as this write."""
     await database.add_to_collection(guild_id, user_id, [card.card_id for card in pulled])
-    return pulled

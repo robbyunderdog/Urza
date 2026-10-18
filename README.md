@@ -46,6 +46,7 @@ scripts/                One-off/periodic maintenance scripts, run manually via `
   sync_set.py              Cache a single set's cards via Scryfall's search API (faster for one set at a time).
   prune_minor_sets.py      Delete cached cards/sets outside the curated "major set" list.
   migrate_card_ids.py      One-time migration from UUID card ids to compact integer ids.
+  cache_card_images.py     Download every missing card image into IMAGE_CACHE_DIR now (the bot also does this on startup and weekly).
 ```
 
 ### Architecture: cogs vs. utils
@@ -93,6 +94,8 @@ scripts/                One-off/periodic maintenance scripts, run manually via `
    | `DATABASE_URL` | yes | Postgres connection string. |
    | `DEV_GUILD_ID` | no | Set during development for instant slash-command sync to one guild. Global sync (empty) can take up to an hour to propagate but works everywhere. |
    | `PACK_COOLDOWN_SECONDS` | no | Override the free-pack cooldown (default: 4h). Handy to set to `0` while testing. |
+   | `IMAGE_CACHE_DIR` | no | Directory to keep downloaded card images in, so repeat cards skip the Scryfall download. Unset = no cache. `docker-compose.yml` sets this itself. |
+   | `IMAGE_CACHE_REFRESH_HOURS` | no | How often the bot downloads missing card images into `IMAGE_CACHE_DIR` (default: 168 = weekly; also runs on startup). |
    | `DB_POOL_MIN_SIZE` / `DB_POOL_MAX_SIZE` | no | Postgres connection pool sizing (defaults: 2 / 20). |
 
 5. **Load card data.** The database schema is created automatically the
@@ -140,6 +143,24 @@ scripts/                One-off/periodic maintenance scripts, run manually via `
    ```bash
    docker build -t urza-bot .
    docker run -d --name urza-bot --env-file .env --restart unless-stopped urza-bot
+   ```
+
+   **Card image cache.** `docker-compose.yml` mounts
+   `/mnt/truenas-share/data/urza/card-images` on the host (override with
+   `IMAGE_CACHE_HOST_DIR` in your shell or a Compose `.env`) at
+   `/data/card-images` in the container, and points `IMAGE_CACHE_DIR` at it.
+   The container runs as uid 1000, so that directory must exist and be
+   writable by uid 1000 before starting — otherwise Docker creates it as
+   root, and the bot logs a warning and runs without caching. Images are
+   stored as `<set_code>/<scryfall_id>-<version>.jpg` (~6.5 GB for every
+   card). The bot downloads every missing image on startup and then every
+   `IMAGE_CACHE_REFRESH_HOURS` (default weekly) in the background — the
+   first run takes a while, later ones only fetch what's new. To kick off
+   a fill by hand, e.g. right after a card sync:
+
+   ```bash
+   docker compose run --rm bot python scripts/cache_card_images.py   # every set, resumable
+   docker compose run --rm bot python scripts/cache_card_images.py --set ecl
    ```
 
 ## How booster packs work
