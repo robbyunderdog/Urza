@@ -28,11 +28,9 @@ MAX_CANDIDATES_SHOWN = 8
 #
 # set_type == "commander" is a special case, not in this set: a set-specific
 # Commander deck (e.g. "Dominaria United Commander") is kept and cached if
-# it has a parent_set_code pointing at a set in here, but never gets its own
-# booster — its cards are only reachable as a bonus pull from the base set's
-# Collector Boosters (see BONUS_SLOT_CHANCE in utils/packs.py). The generic
-# yearly "Commander 20XX" releases have no parent_set_code and are excluded
-# entirely, same as before.
+# it has a parent_set_code pointing at a set in here, and is opened and
+# completed as its own set. The generic yearly "Commander 20XX" releases
+# have no parent_set_code and are excluded entirely.
 MAJOR_SET_TYPES = {"core", "expansion", "masters", "draft_innovation", "funny"}
 
 # The sets table is small (a couple hundred rows) and changes only when an
@@ -80,20 +78,13 @@ class AmbiguousSetError(Exception):
         super().__init__(f"Multiple sets match — did you mean: {names}?")
 
 
-async def resolve_set(query: str, *, exclude_commander: bool = False) -> asyncpg.Record:
+async def resolve_set(query: str) -> asyncpg.Record:
     """Resolve free text like 'mh3' or 'Modern Horizons 3' to a sets row.
 
     Tries, in order: exact code, exact name, unique substring match, then a
     fuzzy match. Raises SetNotFoundError or AmbiguousSetError otherwise.
     Reads from an in-memory cache of the (small, rarely-changing) sets
     table rather than hitting the database on every call.
-
-    exclude_commander drops set_type == 'commander' rows from the
-    substring/fuzzy matching pool (but not the exact code/name checks) —
-    used by /open, where a Commander deck's name (e.g. "Tarkir: Dragonstorm
-    Commander") otherwise fuzzy-matches right alongside its base set and
-    turns an unambiguous query into a bogus "did you mean" prompt, even
-    though the Commander deck was never openable on its own anyway.
     """
     query = query.strip()
     if not query:
@@ -114,7 +105,7 @@ async def resolve_set(query: str, *, exclude_commander: bool = False) -> asyncpg
         if s["name"].lower() == lowered:
             return s
 
-    candidates = [s for s in all_sets if s["set_type"] != "commander"] if exclude_commander else all_sets
+    candidates = all_sets
 
     substring_matches = [s for s in candidates if lowered in s["name"].lower()]
     if len(substring_matches) == 1:

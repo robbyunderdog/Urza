@@ -26,6 +26,10 @@ SCHEMA_PATH = Path(__file__).resolve().parent.parent / "db" / "schema.sql"
 # also checks border_color = 'borderless' independently.
 SPECIAL_TREATMENT_FRAMES = ["extendedart", "showcase", "inverted"]
 _SPECIAL_TREATMENT_SQL = "(frame_effects && {0}::text[] OR border_color = 'borderless')"
+# What pack opening flags with an emoji: special treatments plus full art
+# (which _SPECIAL_TREATMENT_SQL leaves out, since /tradeup's base-printing
+# filter shouldn't exclude full-art cards).
+_IS_SPECIAL_SQL = "(frame_effects && {0}::text[] OR border_color = 'borderless' OR full_art)"
 
 _pool: asyncpg.Pool | None = None
 
@@ -132,11 +136,8 @@ async def get_random_cards(
     exclude_special_treatment: bool = False,
 ) -> list[asyncpg.Record]:
     """Draw random printings. exclude_special_treatment=True restricts to
-    "base" printings (no extended-art/showcase frame) — pack opening draws
-    the base version first, then decides separately whether to upgrade a
-    specific pull to a special-treatment printing of that same card (see
-    get_special_treatment_printing), rather than treating a special
-    printing as just another random member of the normal pool."""
+    "base" printings (no extended-art/showcase frame). Used by /tradeup;
+    pack opening draws from get_random_pack_cards instead."""
     rarities = [rarity] if isinstance(rarity, str) else list(rarity)
     query = (
         "SELECT id, oracle_id, name, rarity, image_url FROM cards "
@@ -157,40 +158,36 @@ async def get_random_cards(
 
 
 async def get_available_rarities(set_code: str) -> set[str]:
-    """Which rarities have at least one non-basic-land, non-special-treatment
-    printing cached for this set — i.e. which rarities a booster slot can
-    actually draw from (matches get_random_cards's own default exclusions).
-    Used to keep pack generation from ever rolling a rarity the set doesn't
-    have (e.g. no mythics in sets printed before 2008's Shards of Alara),
-    which would otherwise silently shrink the pack by a card instead of
-    drawing something else."""
+    """Which rarities have at least one non-basic-land printing cached
+    for this set — i.e. which rarities a pack slot can actually draw
+    from (matches get_random_pack_cards's pool). Used to keep pack
+    generation from ever rolling a rarity the pool doesn't have (e.g. no
+    mythics in sets printed before 2008's Shards of Alara), which would
+    otherwise silently shrink the pack by a card instead of drawing
+    something else."""
     pool = _get_pool()
     rows = await pool.fetch(
-        f"""
-        SELECT DISTINCT rarity FROM cards
-        WHERE set_code = $1 AND is_basic_land = FALSE AND NOT {_SPECIAL_TREATMENT_SQL.format("$2")}
-        """,
+        "SELECT DISTINCT rarity FROM cards WHERE set_code = $1 AND is_basic_land = FALSE",
         set_code,
-        SPECIAL_TREATMENT_FRAMES,
     )
     return {row["rarity"] for row in rows}
 
 
-async def get_special_treatment_printing(oracle_id: str, set_code: str) -> asyncpg.Record | None:
-    """A special-treatment printing (extended art, showcase, borderless,
-    etc. — see SPECIAL_TREATMENT_FRAMES) of this exact card (same
-    oracle_id) within this set, if one exists — used to "upgrade" an
-    already-drawn base card to its special-treatment version, rather than
-    pulling an unrelated special-treatment card from the pool."""
+async def get_random_pack_cards(set_code: str, rarity: str, count: int) -> list[asyncpg.Record]:
+    """Draw `count` distinct random non-basic-land printings of one rarity
+    from this set — every printing (alternate art included) has an equal
+    chance, so a pack's pool is the whole set. is_special flags alternate
+    art for display only (see _IS_SPECIAL_SQL)."""
     pool = _get_pool()
-    return await pool.fetchrow(
+    return await pool.fetch(
         f"""
-        SELECT id, name, rarity, image_url FROM cards
-        WHERE oracle_id = $1 AND set_code = $2 AND {_SPECIAL_TREATMENT_SQL.format("$3")}
-        ORDER BY RANDOM() LIMIT 1
+        SELECT id, name, rarity, image_url, {_IS_SPECIAL_SQL.format("$4")} AS is_special FROM cards
+        WHERE set_code = $1 AND rarity = $2 AND is_basic_land = FALSE
+        ORDER BY RANDOM() LIMIT $3
         """,
-        oracle_id,
         set_code,
+        rarity,
+        count,
         SPECIAL_TREATMENT_FRAMES,
     )
 
@@ -201,13 +198,14 @@ async def get_random_basic_lands(set_code: str, count: int) -> list[asyncpg.Reco
     lands cached at all (e.g. Prophecy never printed its own)."""
     pool = _get_pool()
     return await pool.fetch(
-        """
-        SELECT id, name, rarity, image_url FROM cards
+        f"""
+        SELECT id, name, rarity, image_url, {_IS_SPECIAL_SQL.format("$3")} AS is_special FROM cards
         WHERE set_code = $1 AND is_basic_land = TRUE
         ORDER BY full_art DESC, RANDOM() LIMIT $2
         """,
         set_code,
         count,
+        SPECIAL_TREATMENT_FRAMES,
     )
 
 
@@ -233,29 +231,16 @@ async def upsert_sets(rows: list[tuple]) -> int:
     return len(rows)
 
 
-async def get_bonus_set_code(parent_code: str) -> str | None:
-    """The set-specific Commander deck's code for a base set, if any (e.g.
-    'dmu' -> 'dmc'). None if that base set has no linked Commander deck."""
-    pool = _get_pool()
-    return await pool.fetchval(
-        "SELECT code FROM sets WHERE set_type = 'commander' AND parent_set_code = $1 LIMIT 1", parent_code
-    )
-
-
 async def get_random_open_eligible_set() -> asyncpg.Record | None:
-    """Pick one set at random that /ripbooster and /ripcollector can
-    actually open with no `set` argument given: not a Commander deck (those
-    have no booster of their own — same rule as resolve_set's
-    exclude_commander) and with at least one card already cached (so the
-    pick can't land on a set an admin hasn't synced yet). None if no set
-    currently qualifies."""
+    """Pick one set at random for /rip with no `set` argument given — any
+    set with at least one card already cached (so the pick can't land on a
+    set an admin hasn't synced yet). None if no set currently qualifies."""
     pool = _get_pool()
     return await pool.fetchrow(
         """
         SELECT sets.code, sets.name, sets.set_type, sets.released_at, sets.parent_set_code
         FROM sets
-        WHERE sets.set_type != 'commander'
-          AND EXISTS (SELECT 1 FROM cards WHERE cards.set_code = sets.code)
+        WHERE EXISTS (SELECT 1 FROM cards WHERE cards.set_code = sets.code)
         ORDER BY RANDOM() LIMIT 1
         """
     )
@@ -559,9 +544,11 @@ async def get_all_sets_progress(guild_id: int, user_id: int) -> list[asyncpg.Rec
 # Pack cooldowns
 # ---------------------------------------------------------------------------
 
+# Keyed by pack_cooldowns.booster_type. Only "pack" (utils/packs.py's
+# PACK_TYPE) is live; rows left over from the old "play"/"collector" split
+# are simply never read again.
 PACK_COOLDOWNS = {
-    "play": timedelta(seconds=config.PACK_COOLDOWN_PLAY_SECONDS),
-    "collector": timedelta(seconds=config.PACK_COOLDOWN_COLLECTOR_SECONDS),
+    "pack": timedelta(seconds=config.PACK_COOLDOWN_SECONDS),
 }
 
 
