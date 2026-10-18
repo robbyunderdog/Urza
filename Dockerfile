@@ -9,11 +9,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Now copy the rest of the application.
-COPY . .
-
-# Run as a non-root user.
+# Run as a non-root user. Created before copying the app so the files can
+# be owned by it — COPY otherwise keeps the build machine's ownership and
+# permissions, and a checkout readable only by root (e.g. cloned as root
+# with a strict umask) leaves the bot unable to read its own code.
 RUN useradd --create-home --uid 1000 urza
+
+# Now copy the rest of the application.
+COPY --chown=urza:urza . .
 USER urza
 
 # Unbuffered output so `docker logs` shows log lines as they're emitted
