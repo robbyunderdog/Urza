@@ -17,6 +17,9 @@ from utils.views import SafeView
 
 PACK_VIEW_TIMEOUT_SECONDS = 300
 
+# Servers where /rip has no cooldown at all — the test server.
+NO_COOLDOWN_GUILD_IDS = {762889755066105856}
+
 
 class PackRevealView(SafeView):
     """Flip through a freshly opened pack one card at a time — opened
@@ -162,7 +165,8 @@ class Packs(commands.Cog):
            packs.available_rarities, which is cached in memory). (Also
            only reachable via an explicit `set_query` — a random pick is
            already guaranteed to be cached.)
-        3. The user must not still be on cooldown.
+        3. The user must not still be on cooldown (skipped entirely in
+           NO_COOLDOWN_GUILD_IDS).
 
         Only once all three pass does it actually generate the pack and
         record it into the user's collection.
@@ -181,10 +185,12 @@ class Packs(commands.Cog):
             )
             return
 
-        remaining = await database.claim_free_pack(interaction.guild_id, interaction.user.id, PACK_TYPE)
-        if remaining is not None:
-            await interaction.followup.send(f"Your next free pack is ready in {_format_remaining(remaining)}.")
-            return
+        claimed = interaction.guild_id not in NO_COOLDOWN_GUILD_IDS
+        if claimed:
+            remaining = await database.claim_free_pack(interaction.guild_id, interaction.user.id, PACK_TYPE)
+            if remaining is not None:
+                await interaction.followup.send(f"Your next free pack is ready in {_format_remaining(remaining)}.")
+                return
 
         # The cooldown is already claimed at this point — if anything below
         # fails before the cards are recorded, give the claim back rather
@@ -199,7 +205,8 @@ class Packs(commands.Cog):
         except Exception:
             if render is not None:
                 render.cancel()
-            await database.release_pack_claim(interaction.guild_id, interaction.user.id, PACK_TYPE)
+            if claimed:
+                await database.release_pack_claim(interaction.guild_id, interaction.user.id, PACK_TYPE)
             raise
 
         header = f"{interaction.user.display_name}'s {set_name} pack"
